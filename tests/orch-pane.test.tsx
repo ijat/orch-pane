@@ -754,3 +754,77 @@ test('mobile draws the pane without the Ask box', async ($, on) => {
   expect(await ui.find({ type: 'Text', text: 'Ask' })).toBeUndefined()
   await ui.unmount()
 })
+
+// -- lost calls expire --------------------------------------------------------------------------------
+
+const IDLE_OUT = output({ ...PROGRAM, running: { roles: [], last_spawn: null } })
+
+// What a hot reload leaves: an Ask or a summary marked in flight in $.state, and no code left to settle it.
+// A seeded key reads as its seed, at the store's own version, until the plugin writes it.
+function seedState(on: On, seeds: Record<string, unknown>) {
+  const live = new Set(Object.keys(seeds))
+  const ticks = { n: 0 }
+  on('state.get', async (_, e, next) => {
+    const r = await next(e)
+    const read = r.value as { value?: unknown; version: number } | undefined
+    const seeded = e.plugin === 'orch-pane' && live.has(e.key) && read !== undefined && read.value === undefined
+    return seeded ? ({ value: { value: seeds[e.key], version: read.version } } as typeof r) : r
+  })
+  on('state.set', (_, e, next) => {
+    if (e.plugin === 'orch-pane') live.delete(e.key)
+    if (e.plugin === 'orch-pane' && e.key === 'frame') ticks.n += 1
+    return next(e)
+  })
+  return ticks
+}
+
+// The spinner glyph of a row, which turns only while the 120 ms tick runs.
+const glyphOf = async (ui: { find: (q: { type: string; text: RegExp }) => Promise<{ text: string } | undefined> }, re: RegExp) =>
+  (await ui.find({ type: 'Text', text: re }))?.text?.[0]
+
+test('an Ask left busy by a lost call expires and the tick stops', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: IDLE_OUT, stderr: '' })
+  const ticks = seedState(on, { ask: { state: 'busy', question: 'status?', at: NOW } })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const a = await glyphOf(ui, /thinking…/)
+  await clock.advance(120)
+  expect(await glyphOf(ui, /thinking…/)).not.toBe(a)
+  await clock.advance(50000)
+  expect(await ui.find({ type: 'Text', text: /thinking/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /no answer/ }))?.text).toBe('no answer: aborted')
+  const settled = ticks.n
+  await clock.advance(1200)
+  expect(ticks.n).toBe(settled)
+  await ui.unmount()
+})
+
+test('a summary left pending by a lost call expires, keeps the raw text, and is asked again on re-expand', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: IDLE_OUT, stderr: '' })
+  memStore(on)
+  const calls = haiku(on, () => 'Second try.')
+  const ticks = seedState(on, {
+    expanded: { 'step:app/build:2': true },
+    plain: { [textKey(STEP2_INPUT)]: { state: 'pending', at: NOW } },
+  })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const a = await glyphOf(ui, /plain summary…/)
+  await clock.advance(120)
+  expect(await glyphOf(ui, /plain summary…/)).not.toBe(a)
+  await clock.advance(45000)
+  expect(await ui.find({ type: 'Text', text: /plain summary…/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /no plain summary/ }))?.text).toBe('no plain summary: aborted')
+  expect((await ui.find({ type: 'Text', text: /change thing 2/ }))?.text).toBe('change thing 2')
+  const settled = ticks.n
+  await clock.advance(1200)
+  expect(ticks.n).toBe(settled)
+  expect(calls).toHaveLength(0)
+  await ui.press({ key: 'step:app/build:2' })
+  await ui.press({ key: 'step:app/build:2' })
+  expect(calls).toHaveLength(1)
+  expect((await ui.find({ type: 'Text', text: /Second try/ }))?.text).toBe('✦ Second try.')
+  await ui.unmount()
+})

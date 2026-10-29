@@ -39,6 +39,9 @@ let askStop: AbortController | null = null
 const MODEL = 'haiku'
 const PLAIN_MAX_STORED = 200
 const PLAIN_PENDING_MS = 45000
+// An Ask call is cut at 45 s (its timeoutMs); a `busy` older than this lost its call (a reload, a race).
+const ASK_TIMEOUT_MS = 45000
+const ASK_EXPIRE_MS = ASK_TIMEOUT_MS + 5000
 const PLAIN_SYSTEM = [
   'You rewrite a note from an engineering plan into plain language for the person who owns the project.',
   'Write 2 to 4 short sentences: what this part does and why it matters, in everyday words.',
@@ -113,7 +116,25 @@ async function refreshIfOpen($: EngineInterface) {
   if (await isOpen($)) await fetchStatus($)
 }
 
+// A busy Ask or a pending summary whose call was lost (a hot reload drops the code that would settle it; a
+// race can drop it too) expires to an `aborted` error, so no spinner or tick outlives its call. A live call
+// always settles first: each is cut by its own timeoutMs before its expiry.
+async function expireLost($: EngineInterface) {
+  const now = await $.clock.now()
+  const asked = await read($, ask)
+  if (asked.state === 'busy' && now - asked.at >= ASK_EXPIRE_MS) {
+    await update($, ask, (s): AskState => (s?.state === 'busy' && now - s.at >= ASK_EXPIRE_MS
+      ? { state: 'error', question: s.question, reason: 'aborted' } : s ?? IDLE))
+  }
+  const isLost = (p: PlainEntry) => p.state === 'pending' && now - p.at >= PLAIN_PENDING_MS
+  if (Object.values(await read($, plain)).some(isLost)) {
+    await update($, plain, m => Object.fromEntries(Object.entries(m ?? {}).map(([k, p]): [string, PlainEntry] =>
+      [k, isLost(p) ? { state: 'error', reason: 'aborted' } : p])))
+  }
+}
+
 async function spinIfRunning($: EngineInterface) {
+  await expireLost($)
   const [snap, all] = [await read($, snapshot), await read($, showAll)]
   const running = (snap.data?.tasks ?? []).some(t => (all || t.in_cwd) && isRunning(t))
   const loading = (await read($, ask)).state === 'busy' || Object.values(await read($, plain)).some(p => p.state === 'pending')
@@ -174,11 +195,13 @@ async function askHaiku($: EngineInterface, question: string, tasks: readonly St
   const stop = new AbortController()
   askStop = stop
   const at = await $.clock.now()
+  // `clear` or a newer question ran during that await: writing busy now would leave it with no call.
+  if (askStop !== stop) return
   await update($, ask, (): AskState => ({ state: 'busy', question: q, at }))
   let r
   try {
     r = await $.model.complete({
-      model: MODEL, effort: 'low', maxTokens: 600, timeoutMs: 45000, system: ASK_SYSTEM,
+      model: MODEL, effort: 'low', maxTokens: 600, timeoutMs: ASK_TIMEOUT_MS, system: ASK_SYSTEM,
       prompt: `<status>${askContext(tasks)}</status>\n\nQuestion: ${q}`,
     }, { signal: stop.signal })
   } catch (err) {
