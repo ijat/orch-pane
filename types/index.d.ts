@@ -23,14 +23,23 @@ export type StatusMilestone = {
 
 export type StatusTask = {
   id: string
+  repo: string | null
+  slug: string | null
+  task_dir: string | null
+  repo_path: string | null
+  worktree: string | null
   in_cwd: boolean | null
   state: string
+  state_words: string | null
   mode: string | null
   shape: string | null
   program: boolean | null
   milestone: string | null
   milestone_no: number | null
   summary: string | null
+  updated: string | null
+  last_log: string | null
+  questions_open: number | null
   running: { roles: StatusRole[]; last_spawn: StatusSpawn | null }
   steps: {
     total: number | null
