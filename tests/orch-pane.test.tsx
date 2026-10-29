@@ -99,12 +99,12 @@ test('shows the repo task with bars, markers and the running line, on every surf
     const ui = await $.ui.mount({ ...PANE, surface })
     expect((await ui.find({ type: 'Text', text: /M2 steps/ }))?.text).toBe('M2 steps  █████░░░░░  1/2  50%')
     expect((await ui.find({ type: 'Text', text: /Overall/ }))?.text).toBe('Overall  ~████░░░░░░  ~43% estimate')
-    expect((await ui.find({ type: 'Text', text: /implementer/ }))?.text).toBe('▶ implementer  sonnet/high  steps 2')
+    expect((await ui.find({ type: 'Text', text: /implementer/ }))?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] implementer  sonnet\/high  steps 2$/)
     expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toBe('  running 12m · last: 1')
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:1' }))?.text).toMatch(/^✓ M1 first/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:2' }))?.text).toMatch(/^▶ M2 second.*L/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:3' }))?.text).toMatch(/^· M3 third/)
-    expect((await ui.find({ type: 'Button', key: 'step:app/build:2' }))?.text).toMatch(/^▶ 2 second step/)
+    expect((await ui.find({ type: 'Button', key: 'step:app/build:2' }))?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 2 second step/)
     expect(await ui.find({ type: 'Button', key: 'task:other/fix' })).toBeUndefined()
     await ui.unmount()
   }
@@ -164,6 +164,32 @@ test('polls every 8 s only while the pane is open', async ($, on) => {
   w.paneOpen = false
   await clock.advance(8000)
   expect(w.runs.length).toBe(2)
+})
+
+test('the running spinner turns while open and a role runs, and stops when idle or closed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const glyph = async () => (await ui.find({ type: 'Text', text: /implementer/ }))?.text?.[0]
+  const first = await glyph()
+  await clock.advance(120)
+  const second = await glyph()
+  expect(second).not.toBe(first)
+  w.paneOpen = false
+  await clock.advance(360)
+  expect(await glyph()).toBe(second)
+})
+
+test('an idle task does not spin', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const idle = JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: '/proj', tasks: [{ ...OTHER, in_cwd: true }] })
+  world(on, { exitCode: 0, stdout: idle, stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const before = (await ui.find({ type: 'Button', key: 'task:other/fix' }))?.text
+  await clock.advance(1200)
+  expect((await ui.find({ type: 'Button', key: 'task:other/fix' }))?.text).toBe(before)
 })
 
 test('an open pane that waits undrawn is not polled', async ($, on) => {
