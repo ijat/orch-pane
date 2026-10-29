@@ -64,11 +64,12 @@ const OTHER = {
 
 const OUTPUT = JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: '/proj', tasks: [PROGRAM, OTHER] })
 
-type World = { runs: string[][]; opens: number; paneOpen: boolean; placed: boolean }
+type Ran = { exitCode: number; stdout: string; stderr: string }
+type World = { runs: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran }
 
 // The engine beneath the plugin: env, cwd, the command, panes, and `orch status` itself.
-function world(on: On, result = { exitCode: 0, stdout: OUTPUT, stderr: '' }): World {
-  const w: World = { runs: [], opens: 0, paneOpen: true, placed: true }
+function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }): World {
+  const w: World = { runs: [], opens: 0, paneOpen: true, placed: true, result }
   mock.env(on, { HOME: '/home/u' })
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -84,7 +85,7 @@ function world(on: On, result = { exitCode: 0, stdout: OUTPUT, stderr: '' }): Wo
   }))
   on('process.run', (_, e) => {
     w.runs.push([...e.argv])
-    return { value: { ...result, isStdoutTruncated: false, isStderrTruncated: false } }
+    return { value: { ...w.result, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.complete', () => ({ text: '' }))
   return w
@@ -104,10 +105,11 @@ test('shows the repo task with bars, markers and the running line, on every surf
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /M2 steps/ }))?.text).toBe('M2 steps  █████░░░░░  1/2  50%')
-    expect((await ui.find({ type: 'Text', text: /Overall/ }))?.text).toBe('Overall  ~████░░░░░░  ~43% estimate')
+    expect((await ui.find({ type: 'Text', text: /M2 steps/ }))?.text).toBe('M2 steps  ████████████░░░░░░░░░░░░   50%  1/2')
+    expect((await ui.find({ type: 'Text', text: /Overall/ }))?.text).toBe('Overall   ██████████░░░░░░░░░░░░░░   43%  estimate')
     expect((await ui.find({ type: 'Text', text: /implementer/ }))?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] implementer  sonnet\/high  steps 2$/)
-    expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toBe('  running 12m · last: 1')
+    // The spawn lists its steps, so the status file's older `last: 1` is left out.
+    expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toBe('  running 12m')
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:1' }))?.text).toMatch(/^✓ M1 first/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:2' }))?.text).toMatch(/^▶ M2 second.*L/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:3' }))?.text).toMatch(/^· M3 third/)
@@ -139,8 +141,8 @@ test('a step row expands to its summary and folds again', async ($, on) => {
     const ui = await $.ui.mount({ ...PANE, surface })
     expect(await ui.find({ type: 'Text', text: /change thing 2/ })).toBeUndefined()
     await ui.press({ key: 'step:app/build:2' })
-    expect((await ui.find({ type: 'Text', text: /change thing 2/ }))?.text).toBe('╰ change thing 2')
-    expect((await ui.find({ type: 'Text', text: /and more/ }))?.text).toBe('  and more')
+    expect((await ui.find({ type: 'Text', text: /change thing 2/ }))?.text).toBe('change thing 2')
+    expect((await ui.find({ type: 'Text', text: /and more/ }))?.text).toBe('and more')
     await ui.press({ key: 'step:app/build:2' })
     expect(await ui.find({ type: 'Text', text: /change thing 2/ })).toBeUndefined()
     await ui.unmount()
@@ -407,4 +409,155 @@ test('scope label counts the tasks elsewhere', () => {
   expect(scopeLabel(false, 3)).toBe('[this repo · 3 elsewhere]')
   expect(scopeLabel(false, 0)).toBe('[this repo]')
   expect(scopeLabel(true, 3)).toBe('[all tasks]')
+})
+
+// -- the redesigned pane ---------------------------------------------------------------------------
+
+const output = (...tasks: unknown[]) => JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: '/proj', tasks })
+const PANE60 = (surface: 'terminal' | 'desktop') => ({ ...PANE, surface })
+
+test('the bars line up and carry no tilde', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    const steps = (await ui.find({ type: 'Text', text: /M2 steps/ }))?.text ?? ''
+    const overall = (await ui.find({ type: 'Text', text: /^Overall/ }))?.text ?? ''
+    expect(steps.search(/[█░]/)).toBe(overall.search(/[█░]/))
+    expect(steps.search(/[█░]/)).toBeGreaterThan(0)
+    const tailAt = (row: string) => row.lastIndexOf('░') + 1
+    expect(tailAt(steps)).toBe(tailAt(overall))
+    expect(steps + overall).not.toContain('~')
+    expect((await ui.find({ type: 'Button', key: 'task:app/build' }))?.text).not.toContain('~')
+    await ui.unmount()
+  }
+})
+
+test('the header shows state words, slug or id, the questions badge, and the scope count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: output(PROGRAM, { ...OTHER, questions_open: 2, state: 'awaiting_approval', state_words: 'Waiting for your approval' }), stderr: '' })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo · 1 elsewhere]')
+    const head = (await ui.find({ type: 'Button', key: 'task:app/build' }))?.text
+    expect(head).toMatch(/^▾ build {2}Building {2}43%$/)
+    await ui.press({ key: 'scope' })
+    expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[all tasks]')
+    expect((await ui.find({ type: 'Button', key: 'task:app/build' }))?.text).toMatch(/^▾ app\/build {2}Building/)
+    const heads = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('task:'))
+    expect(heads.map(b => b.key)).toEqual(['task:other/fix', 'task:app/build'])
+    expect(heads[0]?.text).toMatch(/Waiting for your approval {2}\? 2 questions/)
+    await ui.press({ key: 'scope' })
+    await ui.unmount()
+  }
+})
+
+test('the Now section shows the last activity and warns when a task stalls', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const stalled = { ...OTHER, in_cwd: true, state: 'implementing', updated: '2026-10-29T09:00Z',
+    last_log: '2026-10-29T09:00Z orchestrator: orchestrator: round 2 pass' }
+  const busy = { ...PROGRAM, last_log: '2026-10-29T10:18Z implementer: started step(s) 2' }
+  world(on, { exitCode: 0, stdout: output(busy, stalled), stderr: '' })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    expect((await ui.find({ type: 'Text', text: /started step/ }))?.text).toBe('implementer started step(s) 2 · 12m ago')
+    expect((await ui.find({ type: 'Text', text: /round 2 pass/ }))?.text).toBe('orchestrator round 2 pass · 1h 30m ago')
+    expect((await ui.find({ type: 'Text', text: /^idle/ }))?.text).toBe('idle 1h 30m · nothing running')
+    // The stalled task needs attention, so it comes first.
+    const heads = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('task:'))
+    expect(heads.map(b => b.key)).toEqual(['task:other/fix', 'task:app/build'])
+    await ui.unmount()
+  }
+})
+
+test('a failed fetch after a good one keeps the data and says since when', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  await start($, clock)
+  w.result = { exitCode: 1, stdout: '', stderr: 'boom' }
+  await clock.advance(8000)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    const d = new Date(NOW)
+    const at = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+    expect((await ui.find({ type: 'Text', text: /stale since/ }))?.text).toBe(`stale since ${at}`)
+    expect((await ui.find({ type: 'Text', text: /orch status failed/ }))?.text).toBe('orch status failed: boom')
+    expect(await ui.find({ type: 'Button', key: 'task:app/build' })).toBeDefined()
+    await ui.unmount()
+  }
+})
+
+test('sections have headings and the goal is folded to one line until pressed', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const long = { ...PROGRAM, summary: '- goal: build the app with `cargo`\n- approach:\n  - first a **thing**\n  - then another' }
+  world(on, { exitCode: 0, stdout: output(long), stderr: '' })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    for (const h of ['Goal', 'Now', 'Progress', 'Milestones  1/3 done', 'Steps (M2)']) {
+      expect(await ui.find({ type: 'Text', text: h })).toBeDefined()
+    }
+    expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▸ build the app with cargo')
+    expect(await ui.find({ type: 'Text', text: /then another/ })).toBeUndefined()
+    await ui.press({ key: 'goal:app/build' })
+    expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▾ • goal: build the app with cargo')
+    expect((await ui.find({ type: 'Text', text: /first a thing/ }))?.text).toBe('  • first a thing')
+    expect((await ui.find({ type: 'Text', text: /then another/ }))?.text).toBe('  • then another')
+    await ui.press({ key: 'goal:app/build' })
+    await ui.unmount()
+  }
+})
+
+test('a long step list folds around the current step and opens on press', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const items = Array.from({ length: 12 }, (_, i) => ({ id: String(i + 1), title: `step ${i + 1}`, done: i < 5, current: i === 5, summary: null }))
+  const many = { ...PROGRAM, steps: { ...PROGRAM.steps, total: 12, done: 5, percent: 42, current: ['6'], items } }
+  world(on, { exitCode: 0, stdout: output(many), stderr: '' })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    const steps = async () => (await ui.findAll({ type: 'Button' }))
+      .filter(b => b.key?.startsWith('step:') || b.key?.startsWith('fold:app/build:steps')).map(b => b.text)
+    expect(await steps()).toEqual(['✓ 1–5 done', expect.stringMatching(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 6 step 6$/), '· 7 step 7', '· 8 step 8', '· 4 more'])
+    await ui.press({ key: 'fold:app/build:steps' })
+    const open = await steps()
+    expect(open).toHaveLength(13)
+    expect(open[12]).toBe('▴ fold')
+    await ui.press({ key: 'fold:app/build:steps' })
+    expect(await steps()).toHaveLength(5)
+    await ui.unmount()
+  }
+})
+
+const stepColours = async (ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ props: Record<string, unknown> }[]> }) =>
+  (await ui.findAll({ type: 'Text', text: /^█+$/ })).map(t => String(t.props.color)).filter(c => c !== 'claude')
+
+test('the Steps bar shimmers while a role runs and is plain when idle', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const a = await stepColours(ui)
+  expect(a.every(c => /^#[0-9a-f]{6}$/.test(c))).toBe(true)
+  await clock.advance(120)
+  const b = await stepColours(ui)
+  expect(b).not.toEqual(a)
+  // The Overall bar stays one theme colour.
+  expect((await ui.findAll({ type: 'Text', text: /^█+$/ })).filter(t => t.props.color === 'claude')).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('an idle task draws a plain Steps bar', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const idle = { ...PROGRAM, running: { roles: [], last_spawn: null } }
+  world(on, { exitCode: 0, stdout: output(idle), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(await stepColours(ui)).toEqual(['success'])
+  await clock.advance(360)
+  expect(await stepColours(ui)).toEqual(['success'])
+  await ui.unmount()
 })

@@ -279,6 +279,9 @@ export function mdLite(text: string, width: number): MdLine[] {
   return lines
 }
 
+// One line of text with its inline marks (ticks, bold markers) removed: titles and goals in a row.
+export const stripMarks = (text: string) => inline(text).map(r => r.text).join('')
+
 export const lineText = (l: MdLine) => l.lead + l.runs.map(r => r.text).join('')
 
 // The goal as one line: the `- goal:` bullet's text when the summary opens with one, else its first line.

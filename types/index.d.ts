@@ -55,7 +55,8 @@ export type StatusTask = {
 
 export type StatusJson = { schema: 1; generated: string; cwd: string | null; tasks: StatusTask[] }
 
-export type Snapshot = { data: StatusJson | null; error: string | null; fetchedAt: number | null }
+// okAt: when the last good fetch landed (an error keeps it).
+export type Snapshot = { data: StatusJson | null; error: string | null; fetchedAt: number | null; okAt: number | null }
 
 declare module 'claude-code' {
   interface PluginState {
