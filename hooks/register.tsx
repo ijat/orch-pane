@@ -232,32 +232,38 @@ export const register: Register = on => {
       return rows
     }
 
-    const taskBlock = (t: StatusTask) => {
+    const taskBlock = (t: StatusTask, index: number) => {
       const key = `task:${t.id}`
       const isOpenTask = isExpanded(key, t.in_cwd === true)
       const facts = [t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
       const steps = stepsText(t)
       const overall = overallText(t)
       const milestones = t.milestones?.items ?? []
+      const running = runningRows(t)
+      // Each non-empty group is one section; sections are separated by a blank line.
+      const sections = [
+        [facts ? <Text dimColor>{facts}</Text> : null, t.summary && <Text>{t.summary}</Text>,
+          t.error && <Text color="error">{t.error}</Text>],
+        running,
+        [steps && <Text>{steps}</Text>, overall && <Text>{overall}</Text>],
+        milestones.length > 0 ? [<Text bold>Milestones</Text>, ...milestones.map(m => milestoneRow(t, m))] : [],
+        t.steps.items.length > 0
+          ? [<Text bold>{t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'}</Text>,
+            ...t.steps.items.map(s => stepRow(t, s))]
+          : [],
+      ].filter(rows => rows.some(Boolean))
       return (
-        <Box flexDirection="column" marginTop={1}>
+        <Box flexDirection="column" marginTop={index === 0 ? 1 : 2}>
           <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
             {clip(`${isOpenTask ? '▾' : '▸'} ${t.id}`, width - 24)} <Text dimColor>{`${t.state}  ${headPercent(t)}`}</Text>
           </Button>
           {isOpenTask && (
             <Box flexDirection="column" paddingLeft={2}>
-              {facts ? <Text dimColor>{facts}</Text> : null}
-              {t.summary && <Text>{t.summary}</Text>}
-              {t.error && <Text color="error">{t.error}</Text>}
-              {runningRows(t)}
-              {steps && <Text>{steps}</Text>}
-              {overall && <Text>{overall}</Text>}
-              {milestones.length > 0 && <Text bold>Milestones</Text>}
-              {milestones.map(m => milestoneRow(t, m))}
-              {t.steps.items.length > 0 && (
-                <Text bold>{t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'}</Text>
-              )}
-              {t.steps.items.map(s => stepRow(t, s))}
+              {sections.map((rows, i) => (
+                <Box flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+                  {rows}
+                </Box>
+              ))}
             </Box>
           )}
         </Box>
