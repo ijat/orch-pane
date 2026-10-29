@@ -4,7 +4,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
   askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
-  overallTail, scopeLabel, shimmer, sortByAttention, stepsTail, textKey,
+  overallTail, plainInput, scopeLabel, shimmer, sortByAttention, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
 import type { StatusTask } from '../types'
@@ -503,7 +503,8 @@ test('sections have headings and the goal is folded to one line until pressed', 
     expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▸ build the app with cargo')
     expect(await ui.find({ type: 'Text', text: /then another/ })).toBeUndefined()
     await ui.press({ key: 'goal:app/build' })
-    expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▾ • goal: build the app with cargo')
+    expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▾ build the app with cargo')
+    expect((await ui.find({ type: 'Text', text: /• goal:/ }))?.text).toBe('• goal: build the app with cargo')
     expect((await ui.find({ type: 'Text', text: /first a thing/ }))?.text).toBe('  • first a thing')
     expect((await ui.find({ type: 'Text', text: /then another/ }))?.text).toBe('  • then another')
     await ui.press({ key: 'goal:app/build' })
@@ -559,5 +560,197 @@ test('an idle task draws a plain Steps bar', async ($, on) => {
   expect(await stepColours(ui)).toEqual(['success'])
   await clock.advance(360)
   expect(await stepColours(ui)).toEqual(['success'])
+  await ui.unmount()
+})
+
+// -- Haiku: plain summaries and the Ask box ---------------------------------------------------------
+
+const USAGE = { input_tokens: 1, output_tokens: 1, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 }
+type Call = { model: string; effort?: string; prompt: string; system?: string }
+
+// The model beneath the plugin: records each call and answers `reply` (a text, or a failure reason).
+function haiku(on: On, reply: (prompt: string) => string | { reason: 'api-error' } = () => 'In plain words.') {
+  const calls: Call[] = []
+  on('model.complete', (_, e) => {
+    calls.push({ model: e.model, effort: e.effort, prompt: e.prompt, system: e.system })
+    const r = reply(e.prompt)
+    return typeof r === 'string'
+      ? { value: { isAnswered: true as const, text: r, usage: USAGE } }
+      : { value: { isAnswered: false as const, reason: 'api-error' as const, status: 500, error: 'server_error' as const, usage: USAGE } }
+  })
+  return calls
+}
+
+// $.store in memory, in insertion order, as the engine keeps it.
+function memStore(on: On, seed: Record<string, unknown> = {}) {
+  const map = new Map<string, unknown>(Object.entries(seed))
+  on('store.get', (_, e) => ({ value: map.get(e.key) }))
+  on('store.set', (_, e) => {
+    map.set(e.key, e.value)
+    return { value: undefined }
+  })
+  on('store.delete', (_, e) => {
+    map.delete(e.key)
+    return { value: undefined }
+  })
+  on('store.keys', () => ({ value: [...map.keys()] }))
+  return map
+}
+
+const STEP2_INPUT = plainInput('step', 'second step', 'change thing 2\nand more')
+
+test('expanding a step asks Haiku once for a plain summary and caches it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on)
+  const store = memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(calls).toHaveLength(0)
+  await ui.press({ key: 'step:app/build:2' })
+  expect(calls).toHaveLength(1)
+  expect(calls[0]).toMatchObject({ model: 'haiku', effort: 'low' })
+  expect(calls[0]?.prompt).toContain('change thing 2')
+  expect((await ui.find({ type: 'Text', text: /In plain words/ }))?.text).toBe('✦ In plain words.')
+  expect(await ui.find({ type: 'Text', text: /change thing 2/ })).toBeUndefined()
+  expect(store.get(`plain:${textKey(STEP2_INPUT)}`)).toEqual({ text: 'In plain words.' })
+  await ui.press({ key: 'step:app/build:2' })
+  await ui.press({ key: 'step:app/build:2' })
+  expect(calls).toHaveLength(1)
+  // Raw stays reachable.
+  await ui.press({ key: 'raw:step:app/build:2' })
+  expect((await ui.find({ type: 'Text', text: /change thing 2/ }))?.text).toBe('change thing 2')
+  expect((await ui.find({ type: 'Button', key: 'raw:step:app/build:2' }))?.text).toBe('plain')
+  await ui.press({ key: 'raw:step:app/build:2' })
+  expect((await ui.find({ type: 'Text', text: /In plain words/ }))?.text).toBe('✦ In plain words.')
+  await ui.unmount()
+})
+
+test('a summary stored by an earlier session is not asked again', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on)
+  memStore(on, { [`plain:${textKey(STEP2_INPUT)}`]: { text: 'From the cache.' } })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    await ui.press({ key: 'step:app/build:2' })
+    expect((await ui.find({ type: 'Text', text: /From the cache/ }))?.text).toBe('✦ From the cache.')
+    await ui.press({ key: 'step:app/build:2' })
+    await ui.unmount()
+  }
+  expect(calls).toHaveLength(0)
+})
+
+test('a failed summary keeps the raw text and says why', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  haiku(on, () => ({ reason: 'api-error' }))
+  const store = memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('desktop'))
+  await ui.press({ key: 'step:app/build:2' })
+  expect((await ui.find({ type: 'Text', text: /change thing 2/ }))?.text).toBe('change thing 2')
+  expect((await ui.find({ type: 'Text', text: /no plain summary/ }))?.text).toBe('no plain summary: api-error')
+  expect(store.size).toBe(0)
+  await ui.unmount()
+})
+
+test('the goal and milestones get plain summaries too', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on, prompt => (prompt.includes('goal') ? 'The app gets built.' : 'Milestone two.'))
+  memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'goal:app/build' })
+  expect((await ui.find({ type: 'Text', text: /The app gets built/ }))?.text).toBe('✦ The app gets built.')
+  await ui.press({ key: 'ms:app/build:2' })
+  expect((await ui.find({ type: 'Text', text: /Milestone two/ }))?.text).toBe('✦ Milestone two.')
+  expect(calls.map(c => c.model)).toEqual(['haiku', 'haiku'])
+  await ui.unmount()
+})
+
+test('no model call happens at start, on polls or on draws', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on)
+  memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await clock.advance(16000)
+  await $.turn.complete({ answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' })
+  await clock.settle()
+  await ui.press({ key: 'scope' })
+  expect(calls).toHaveLength(0)
+  await ui.unmount()
+})
+
+test('the store keeps the newest 200 summaries', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  haiku(on)
+  const seed = Object.fromEntries(Array.from({ length: 200 }, (_, i) => [`plain:old${i}`, { text: `t${i}` }]))
+  const store = memStore(on, { other: 1, ...seed })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'step:app/build:2' })
+  const kept = [...store.keys()].filter(k => k.startsWith('plain:'))
+  expect(kept).toHaveLength(200)
+  expect(kept).not.toContain('plain:old0')
+  expect(kept).toContain('plain:old1')
+  expect(kept).toContain(`plain:${textKey(STEP2_INPUT)}`)
+  expect(store.get('other')).toBe(1)
+  await ui.unmount()
+})
+
+test('the Ask box answers a question from the status of the shown tasks', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on, () => 'The implementer is on step 2.')
+  memStore(on)
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    expect(await ui.find({ type: 'Text', text: 'Ask' })).toBeDefined()
+    expect((await ui.find({ type: 'Input', key: 'ask' }))?.props.placeholder).toBe('Ask about these tasks…')
+    await ui.input({ key: 'ask', text: '   ' })
+    expect(calls).toHaveLength(0)
+    await ui.input({ key: 'ask', text: 'what is running?' })
+    expect(calls).toHaveLength(1)
+    expect(calls[0]).toMatchObject({ model: 'haiku', effort: 'low' })
+    expect(calls[0]?.prompt).toContain('<status>')
+    expect(calls[0]?.prompt).toContain('"id":"app/build"')
+    expect(calls[0]?.prompt).not.toContain('other/fix')
+    expect(calls[0]?.prompt).toMatch(/Question: what is running\?$/)
+    expect((await ui.find({ type: 'Text', text: /^Q:/ }))?.text).toBe('Q: what is running?')
+    expect((await ui.find({ type: 'Text', text: /implementer is on step 2/ }))?.text).toBe('The implementer is on step 2.')
+    await ui.press({ key: 'ask-clear' })
+    expect(await ui.find({ type: 'Text', text: /implementer is on step 2/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Button', key: 'ask-clear' })).toBeUndefined()
+    calls.length = 0
+    await ui.unmount()
+  }
+})
+
+test('a failed answer says why', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  haiku(on, () => ({ reason: 'api-error' }))
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.input({ key: 'ask', text: 'status?' })
+  expect((await ui.find({ type: 'Text', text: /no answer/ }))?.text).toBe('no answer: api-error')
+  await ui.unmount()
+})
+
+test('mobile draws the pane without the Ask box', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  expect(await ui.find({ type: 'Button', key: 'task:app/build' })).toBeDefined()
+  expect(await ui.find({ type: 'Input', key: 'ask' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Ask' })).toBeUndefined()
   await ui.unmount()
 })

@@ -403,6 +403,10 @@ export function textKey(text: string): string {
   return `p1-${n.toString(16).padStart(14, '0')}`
 }
 
+// What a plain-language summary is asked about, and so what its cache key covers.
+export const plainInput = (kind: 'goal' | 'milestone' | 'step', title: string | null, summary: string) =>
+  `${kind}${title ? `: ${title}` : ''}\n\n${summary}`
+
 const ITEM_CLIP = 160
 
 type Lean = Omit<StatusTask, 'task_dir' | 'repo_path' | 'worktree'>

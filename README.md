@@ -25,3 +25,9 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 ## Use
 
 `/orch-pane` opens the pane. It opens by itself at session start when the folder belongs to an active task's repo or worktree. The `[this repo]` / `[all tasks]` button switches scope.
+
+Tasks that need you (open questions, an error, or work that stalled for over 30 minutes) come first. Each task shows its Goal (one line; click to open), Now (what runs and the last activity), Progress, and its Milestones and Steps, folded around the current one; click a fold row to see them all.
+
+Opening a goal, milestone or step also asks Haiku (lowest effort) for a plain-language summary of it, once per text: summaries are kept in the mod's own store across sessions. The `raw` button shows the original text.
+
+The Ask box at the bottom answers questions about the shown tasks with Haiku, from their `orch status` data. It only reads; it changes nothing.
