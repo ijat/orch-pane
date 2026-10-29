@@ -58,6 +58,16 @@ export type StatusJson = { schema: 1; generated: string; cwd: string | null; tas
 // okAt: when the last good fetch landed (an error keeps it).
 export type Snapshot = { data: StatusJson | null; error: string | null; fetchedAt: number | null; okAt: number | null }
 
+// A plain-language summary, by the cache key of the text it summarises.
+export type PlainEntry = { state: 'pending'; at: number } | { state: 'done'; text: string } | { state: 'error'; reason: string }
+
+// The Ask box's one question and its answer.
+export type AskState =
+  | { state: 'idle' }
+  | { state: 'busy'; question: string; at: number }
+  | { state: 'done'; question: string; answer: string }
+  | { state: 'error'; question: string; reason: string }
+
 declare module 'claude-code' {
   interface PluginState {
     'orch-pane': {
@@ -66,6 +76,8 @@ declare module 'claude-code' {
       expanded: Record<string, boolean>
       dismissed: boolean
       frame: number
+      plain: Record<string, PlainEntry>
+      ask: AskState
     }
   }
 }
