@@ -2,6 +2,13 @@ import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
+import {
+  askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
+  overallTail, scopeLabel, shimmer, sortByAttention, stepsTail, textKey,
+} from '../hooks/lib'
+import type { ItemState, MdLine } from '../hooks/lib'
+import type { StatusTask } from '../types'
+
 const NOW = Date.parse('2026-10-29T10:30Z')
 
 const PANE = {
@@ -225,4 +232,179 @@ test('a snapshot an earlier version stored is declined', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /Loading/ }))?.text).toBe('Loading…')
   await ui.unmount()
+})
+
+// -- pure logic (hooks/lib.ts) --------------------------------------------------------------------
+
+const REAL_STEP = 'workspace (edition 2024, `resolver = "3"`, `members = ["crates/*", "services/*"]`, `[workspace.dependencies]` with exact versions, `[workspace.lints]` with `unsafe_code = "forbid"`, clippy pedantic off, `unwrap_used = "deny"` outside tests); toolchain `1.99.1` with rustfmt and clippy; `.gitignore` (`/target`, `/.testkit/`, `.DS_Store`); justfile recipes `ci`, `fmt`, `lint`, `test`, `test-unit`,…'
+const REAL_GOAL = "- goal: Chrome extensions run in Luneium on a complete chrome.* API that Luneium builds itself, and LastPass, uBlock\n  Origin and uBO Lite work end to end. Page context menus (ROADMAP Next) come first, with room for extension items.\n- changed:\n  - rev 1: the user's D1 (own layer, complete API) and the acceptance tests;\n  - rev 2: the gate answers and the plan review, including the `LUNEIUM_EXTENSIONS` gate (D28);"
+
+const widest = (lines: MdLine[]) => Math.max(...lines.map(l => lineText(l).length))
+
+test('mdLite: bullets, keys, code and bold marks, nesting', () => {
+  const [line, ...rest] = mdLite('- goal: build the app', 40)
+  expect(rest).toHaveLength(0)
+  expect(line?.lead).toBe('• ')
+  expect(line?.runs).toEqual([{ text: 'goal:', key: true }, { text: ' build the app' }])
+
+  const nested = mdLite('- a\n  - b\n    - c', 40)
+  expect(nested.map(l => l.lead)).toEqual(['• ', '  • ', '    • '])
+
+  const code = mdLite('use `orch status --json` now', 40)
+  expect(code[0]?.runs).toEqual([{ text: 'use ' }, { text: 'orch status --json', code: true }, { text: ' now' }])
+  expect(code.map(lineText).join('')).not.toContain('`')
+
+  const bold = mdLite('**bold** text', 40)
+  expect(bold[0]?.runs).toEqual([{ text: 'bold', bold: true }, { text: ' text' }])
+
+  expect(mdLite('- **goal:** do it', 40)[0]?.runs[0]).toEqual({ text: 'goal:', key: true })
+  expect(lineText(mdLite('an `unclosed tick and **open', 40)[0]!)).toBe('an `unclosed tick and **open')
+})
+
+test('mdLite: wraps with hanging indents, hard-breaks long tokens, folds blank runs', () => {
+  const long = mdLite(`- ${'word '.repeat(40).trim()}`, 40)
+  expect(long.length).toBeGreaterThan(1)
+  expect(widest(long)).toBeLessThanOrEqual(40)
+  expect(long.slice(1).every(l => l.lead === '  ')).toBe(true)
+
+  const path = mdLite(`x ${'/a'.repeat(35)} y`, 30)
+  expect(widest(path)).toBeLessThanOrEqual(30)
+  expect(path.map(l => l.runs.map(r => r.text).join('')).join('')).toContain('/a/a')
+
+  const blanks = mdLite('one\n\n\n\ntwo\n\n', 40)
+  expect(blanks.map(lineText)).toEqual(['one', '', 'two'])
+
+  const real = mdLite(REAL_STEP, 56)
+  expect(widest(real)).toBeLessThanOrEqual(56)
+  expect(real.some(l => l.runs.some(r => r.text.includes('`')))).toBe(false)
+  expect(real.map(lineText).join(' ')).toContain('test-unit,…')
+
+  for (const width of [12, 20, 33, 56, 80]) expect(widest(mdLite(REAL_GOAL, width))).toBeLessThanOrEqual(width)
+  // A source line that continues a bullet joins it.
+  expect(lineText(mdLite(REAL_GOAL, 400)[0]!)).toContain('uBlock Origin and uBO Lite')
+})
+
+test('goalLine takes the goal bullet, else the first line', () => {
+  expect(goalLine('- goal: build the app')).toBe('build the app')
+  expect(goalLine('- **goal:** turn `x` into y\n- approach: z')).toBe('turn x into y')
+  expect(goalLine(REAL_GOAL)).toMatch(/^Chrome extensions .* uBlock Origin and uBO Lite work end to end\./)
+  expect(goalLine('Fix the **thing**\nmore')).toBe('Fix the thing')
+  expect(goalLine(null)).toBeNull()
+  expect(goalLine('  \n')).toBeNull()
+})
+
+const st = (spec: string) => [...spec].map(c => (c === 'd' ? 'done' : c === 'c' ? 'current' : 'pending') as ItemState)
+const foldOf = (spec: string) => fold(st(spec), s => s)
+
+test('fold keeps the current item and the next two pending in view', () => {
+  expect(foldOf('dddddcpppppp')).toEqual([
+    { kind: 'done', from: 0, to: 4 }, { kind: 'item', index: 5 }, { kind: 'item', index: 6 },
+    { kind: 'item', index: 7 }, { kind: 'more', from: 8, to: 11 },
+  ])
+  expect(foldOf('ddpdpppp')).toEqual([
+    { kind: 'done', from: 0, to: 1 }, { kind: 'item', index: 2 }, { kind: 'item', index: 3 },
+    { kind: 'item', index: 4 }, { kind: 'item', index: 5 }, { kind: 'item', index: 6 }, { kind: 'item', index: 7 },
+  ])
+  expect(foldOf('dddddd')).toEqual([{ kind: 'done', from: 0, to: 5 }])
+  expect(foldOf('dcp')).toEqual([{ kind: 'item', index: 0 }, { kind: 'item', index: 1 }, { kind: 'item', index: 2 }])
+  expect(foldOf('')).toEqual([])
+  const two = foldOf('ddcdcpppp')
+  expect(two.filter(r => r.kind === 'item').map(r => (r as { index: number }).index)).toEqual(expect.arrayContaining([2, 4]))
+  // Every index exactly once, in order.
+  for (const spec of ['dddddcpppppp', 'ddpdpppp', 'pdpdcdpdpp', 'ccc', 'pppppppp']) {
+    const covered = foldOf(spec).flatMap(r => (r.kind === 'item' ? [r.index] : Array.from({ length: r.to - r.from + 1 }, (_, i) => r.from + i)))
+    expect(covered).toEqual([...spec].map((_, i) => i))
+  }
+})
+
+test('bar layout aligns labels and tails, with no tilde', () => {
+  const bars = [{ label: 'M2 steps', tail: stepsTail(50, 1, 2) }, { label: 'Overall', tail: overallTail(43, true) }]
+  expect(bars.map(b => b.tail)).toEqual([' 50%  1/2', ' 43%  estimate'])
+  expect(barLayout(56, bars)).toEqual({ labelW: 10, barW: 24, tailW: 14 })
+  expect(barLayout(30, bars).barW).toBe(10)
+  expect(barCells(43, 24)).toBe(10)
+  expect(barCells(100, 24)).toBe(24)
+  expect(barCells(0, 24)).toBe(0)
+  expect(overallTail(100, false)).toBe('100%')
+})
+
+test('shimmer moves one cell per frame and repeats', () => {
+  expect(shimmer(0, 5)).toEqual([])
+  const a = shimmer(12, 7)
+  expect(a).toHaveLength(12)
+  expect(a.every(c => /^#[0-9a-f]{6}$/.test(c))).toBe(true)
+  expect(shimmer(12, 7)).toEqual(a)
+  expect(shimmer(12, 7 + 18)).toEqual(a)
+  for (const filled of [3, 5, 12, 24]) {
+    for (let f = 0; f < filled + 7; f++) expect(shimmer(filled, f + 1)).not.toEqual(shimmer(filled, f))
+  }
+})
+
+const T0 = Date.parse('2026-10-29T10:00Z')
+const task = (over: Partial<StatusTask>): StatusTask => ({
+  id: 'r/t', repo: 'r', slug: 't', task_dir: null, repo_path: null, worktree: null, in_cwd: true,
+  state: 'implementing', state_words: 'Building', mode: null, shape: null, program: false, milestone: null,
+  milestone_no: null, summary: null, updated: '2026-10-29T10:00Z', last_log: null, questions_open: 0,
+  running: { roles: [], last_spawn: null },
+  steps: { total: null, done: null, percent: null, current: null, items: [] },
+  milestones: null, overall: { percent: null, estimate: false, basis: '' }, error: null, ...over,
+})
+
+test('stale means an active task with nothing running for over 30 minutes', () => {
+  expect(isStale(task({}), T0 + 31 * 60000)).toBe(true)
+  expect(isStale(task({}), T0 + 29 * 60000)).toBe(false)
+  expect(isStale(task({ state: 'awaiting_approval' }), T0 + 300 * 60000)).toBe(false)
+  const running = { roles: [{ role: 'implementer', state: 'in_progress', step: null, note: null }], last_spawn: null }
+  expect(isStale(task({ running }), T0 + 300 * 60000)).toBe(false)
+  expect(idleMinutes(task({ last_log: '2026-10-29T10:20:30Z x: y' }), T0 + 30 * 60000)).toBe(9)
+  expect(idleMinutes(task({ updated: null }), T0)).toBeNull()
+})
+
+test('tasks needing attention sort first, the rest keep their order', () => {
+  const a = task({ id: 'a', state: 'awaiting_approval' })
+  const b = task({ id: 'b', state: 'awaiting_approval' })
+  const q = task({ id: 'q', state: 'awaiting_approval', questions_open: 2 })
+  const e = task({ id: 'e', state: 'awaiting_approval', error: 'bad' })
+  expect(sortByAttention([a, b, q, e], T0).map(t => t.id)).toEqual(['q', 'e', 'a', 'b'])
+  expect(sortByAttention([a, task({ id: 's' })], T0 + 60 * 60000).map(t => t.id)).toEqual(['s', 'a'])
+})
+
+test('lastActivity parses the log line', () => {
+  expect(lastActivity(task({ last_log: '2026-10-29T15:17Z implementer: started step(s) 6' }))).toEqual({
+    who: 'implementer', text: 'started step(s) 6', at: '2026-10-29T15:17Z',
+  })
+  expect(lastActivity(task({ last_log: '2026-10-27T07:47Z orchestrator: orchestrator: M4 passed' }))?.text).toBe('M4 passed')
+  expect(lastActivity(task({ last_log: '2026-09-28T17:23:19Z orchestrator: CI green' }))?.at).toBe('2026-09-28T17:23:19Z')
+  expect(lastActivity(task({}))).toEqual({ who: '', text: 'updated', at: '2026-10-29T10:00Z' })
+  expect(lastActivity(task({ updated: null }))).toBeNull()
+})
+
+test('hhmm is local wall-clock time', () => {
+  const d = new Date(T0)
+  expect(hhmm(T0)).toBe(`${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`)
+})
+
+test('textKey is a stable, versioned hash', () => {
+  expect(textKey('abc')).toBe(textKey('abc'))
+  expect(textKey('abc')).toMatch(/^p1-[0-9a-f]{14}$/)
+  expect(textKey('abd')).not.toBe(textKey('abc'))
+  expect(textKey('')).toMatch(/^p1-[0-9a-f]{14}$/)
+})
+
+test('askContext drops paths and stays within its limit', () => {
+  const items = Array.from({ length: 30 }, (_, i) => ({ id: String(i + 1), title: `s${i}`, done: false, current: false, summary: 'x'.repeat(400) }))
+  const big = task({ task_dir: '~/secret/dir', repo_path: '/p', steps: { total: 30, done: 0, percent: 0, current: null, items } })
+  const full = askContext([big])
+  expect(full).not.toContain('task_dir')
+  expect(full).toContain('x'.repeat(400))
+  const small = askContext([big], 6000)
+  expect(small).not.toContain('x'.repeat(400))
+  expect(small.length <= 6000 || !small.includes('xxx')).toBe(true)
+  expect(JSON.parse(small)[0].steps.items).toHaveLength(30)
+})
+
+test('scope label counts the tasks elsewhere', () => {
+  expect(scopeLabel(false, 3)).toBe('[this repo · 3 elsewhere]')
+  expect(scopeLabel(false, 0)).toBe('[this repo]')
+  expect(scopeLabel(true, 3)).toBe('[all tasks]')
 })
