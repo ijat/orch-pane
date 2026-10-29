@@ -14,6 +14,11 @@ const snapshot = atom({ plugin: 'orch-pane', key: 'snapshot' } as const, EMPTY, 
 const showAll = atom({ plugin: 'orch-pane', key: 'showAll' } as const, false)
 const expanded = atom({ plugin: 'orch-pane', key: 'expanded' } as const, {} as Record<string, boolean>)
 const dismissed = atom({ plugin: 'orch-pane', key: 'dismissed' } as const, false)
+// Spinner frame: ticks only while the pane is drawn and a shown task has a role running.
+const frame = atom({ plugin: 'orch-pane', key: 'frame' } as const, 0)
+
+const SPIN_MS = 120
+const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 let inFlight = false
 
@@ -77,12 +82,29 @@ async function refreshIfOpen($: EngineInterface) {
   if (await isOpen($)) await fetchStatus($)
 }
 
+const isRunning = (t: StatusTask) =>
+  t.running.roles.length > 0 || (t.running.last_spawn !== null && !t.running.last_spawn.returned)
+
+async function spinIfRunning($: EngineInterface) {
+  const [snap, all] = [await read($, snapshot), await read($, showAll)]
+  const busy = (snap.data?.tasks ?? []).some(t => (all || t.in_cwd) && isRunning(t))
+  if (busy && (await isOpen($))) await update($, frame, n => ((n ?? 0) + 1) % SPINNER.length)
+}
+
 // -- drawing helpers -----------------------------------------------------------------------------
 
-function bar(percent: number) {
-  const filled = Math.max(0, Math.min(10, Math.round(percent / 10)))
-  return '█'.repeat(filled) + '░'.repeat(10 - filled)
+const barCells = (percent: number) => Math.max(0, Math.min(10, Math.round(percent / 10)))
+
+// Theme keys, so the colors follow the person's theme.
+function stateColor(state: string) {
+  if (/done|merged|complete/.test(state)) return 'success'
+  if (/block|fail|error|stop|abort/.test(state)) return 'error'
+  if (/await|question|pause|wait/.test(state)) return 'warning'
+  return 'claude'
 }
+
+const markerColor = (state: 'done' | 'current' | 'pending') =>
+  state === 'done' ? 'success' : state === 'current' ? 'claude' : undefined
 
 function elapsed(fromIso: string | null, now: number | null) {
   if (!fromIso || now === null) return null
@@ -103,17 +125,21 @@ const marker = (state: 'done' | 'current' | 'pending') =>
 const stepState = (s: StatusStep): 'done' | 'current' | 'pending' =>
   s.done ? 'done' : s.current ? 'current' : 'pending'
 
-function overallText(t: StatusTask) {
+type Bar = { label: string; percent: number; tail: string; estimate: boolean }
+
+function overallBar(t: StatusTask): Bar | null {
   const p = t.overall.percent
   if (p === null) return null
-  return t.overall.estimate ? `Overall  ~${bar(p)}  ~${p}% estimate` : `Overall  ${bar(p)}  ${p}%`
+  return t.overall.estimate
+    ? { label: 'Overall  ~', percent: p, tail: `~${p}% estimate`, estimate: true }
+    : { label: 'Overall  ', percent: p, tail: `${p}%`, estimate: false }
 }
 
-function stepsText(t: StatusTask) {
+function stepsBar(t: StatusTask): Bar | null {
   const { done, total, percent } = t.steps
   if (total === null || done === null || percent === null) return null
   const label = t.program && t.milestone_no !== null ? `M${t.milestone_no} steps` : 'Steps'
-  return `${label}  ${bar(percent)}  ${done}/${total}  ${percent}%`
+  return { label: `${label}  `, percent, tail: `${done}/${total}  ${percent}%`, estimate: false }
 }
 
 const headPercent = (t: StatusTask) =>
@@ -126,6 +152,7 @@ export const register: Register = on => {
       description: 'Show the orchestration tasks of this repo in a pane',
     })
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
+    $.clock.every(SPIN_MS, () => void spinIfRunning($))
     void (async () => {
       const data = await fetchStatus($)
       if (data?.tasks.some(t => t.in_cwd) && !(await read($, dismissed))) {
@@ -165,6 +192,7 @@ export const register: Register = on => {
     const snap = await read($, snapshot)
     const all = await read($, showAll)
     const open = await read($, expanded)
+    const spin = SPINNER[(await read($, frame)) % SPINNER.length]
     const width = Math.max(16, e.props.bodyColumns)
     const tasks = (snap.data?.tasks ?? []).filter(t => all || t.in_cwd)
     const isExpanded = (key: string, fallback: boolean) => open[key] ?? fallback
@@ -184,14 +212,33 @@ export const register: Register = on => {
       )
     }
 
+    const barRow = (b: Bar, color: string) => {
+      const filled = barCells(b.percent)
+      return (
+        <Text>
+          <Text bold>{b.label}</Text>
+          <Text color={color}>{'█'.repeat(filled)}</Text>
+          <Text dimColor>{'░'.repeat(10 - filled)}</Text>
+          <Text color={b.estimate ? undefined : color} dimColor={b.estimate}>{`  ${b.tail}`}</Text>
+        </Text>
+      )
+    }
+
+    const markerText = (state: 'done' | 'current' | 'pending', running: boolean) => (
+      <Text color={markerColor(state)} dimColor={state === 'pending'}>
+        {state === 'current' && running ? spin : marker(state)}
+      </Text>
+    )
+
     const milestoneRow = (t: StatusTask, m: StatusMilestone) => {
       const key = `ms:${t.id}:${m.n}`
       const size = m.size && m.size !== '-' ? m.size : ''
-      const label = clip(`${marker(m.state)} M${m.n} ${m.goal ?? ''}`, width - 6 - size.length)
+      const label = clip(`M${m.n} ${m.goal ?? ''}`, width - 8 - size.length)
       return (
         <Box flexDirection="column">
           <Button key={key} plain onPress={toggle(key, false)}>
-            {label} <Text dimColor>{size}</Text>
+            {markerText(m.state, false)} <Text dimColor={m.state === 'pending'} bold={m.state === 'current'}>{label}</Text>{' '}
+            <Text color="subtle">{size}</Text>
           </Button>
           {isExpanded(key, false) && summaryBlock(m.summary, 2)}
         </Box>
@@ -200,10 +247,12 @@ export const register: Register = on => {
 
     const stepRow = (t: StatusTask, s: StatusStep) => {
       const key = `step:${t.id}:${s.id}`
+      const state = stepState(s)
       return (
         <Box flexDirection="column">
           <Button key={key} plain onPress={toggle(key, false)}>
-            {clip(`${marker(stepState(s))} ${s.id} ${s.title ?? ''}`, width - 4)}
+            {markerText(state, isRunning(t))}{' '}
+            <Text dimColor={state === 'pending'} bold={state === 'current'}>{clip(`${s.id} ${s.title ?? ''}`, width - 6)}</Text>
           </Button>
           {isExpanded(key, false) && summaryBlock(s.summary, 2)}
         </Box>
@@ -214,12 +263,16 @@ export const register: Register = on => {
       const spawn = t.running.last_spawn
       const rows = t.running.roles.map(r => {
         const mine = spawn && spawn.role === r.role ? spawn : null
-        const head = [`▶ ${r.role ?? '?'}`, mine?.tier, mine?.steps?.length ? `steps ${mine.steps.join(',')}` : null]
         const since = mine && !mine.returned ? elapsed(mine.ts, snap.fetchedAt) : null
         const tail = [since ? `running ${since}` : null, r.step ? `last: ${r.step}` : null].filter(Boolean)
         return (
           <Box flexDirection="column">
-            <Text>{head.filter(Boolean).join('  ')}</Text>
+            <Text>
+              <Text color="claude">{`${spin} `}</Text>
+              <Text bold color="claude">{r.role ?? '?'}</Text>
+              {mine?.tier ? <Text color="permission">{`  ${mine.tier}`}</Text> : null}
+              {mine?.steps?.length ? <Text color="suggestion">{`  steps ${mine.steps.join(',')}`}</Text> : null}
+            </Text>
             {tail.length > 0 && <Text dimColor>{`  ${tail.join(' · ')}`}</Text>}
           </Box>
         )
@@ -227,35 +280,45 @@ export const register: Register = on => {
       if (rows.length === 0 && spawn) {
         const parts = [`last spawn: ${spawn.role ?? '?'}`, spawn.tier, spawn.steps?.length ? `steps ${spawn.steps.join(',')}` : null,
           spawn.returned ? 'returned' : `running ${elapsed(spawn.ts, snap.fetchedAt) ?? ''}`.trim()]
-        rows.push(<Text dimColor>{parts.filter(Boolean).join('  ')}</Text>)
+        rows.push(
+          <Text>
+            {spawn.returned ? null : <Text color="claude">{`${spin} `}</Text>}
+            <Text dimColor>{parts.filter(Boolean).join('  ')}</Text>
+          </Text>,
+        )
       }
       return rows
     }
 
+    const heading = (text: string) => <Text bold color="suggestion">{text}</Text>
+
     const taskBlock = (t: StatusTask, index: number) => {
       const key = `task:${t.id}`
       const isOpenTask = isExpanded(key, t.in_cwd === true)
+      const color = stateColor(t.state)
       const facts = [t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
-      const steps = stepsText(t)
-      const overall = overallText(t)
+      const steps = stepsBar(t)
+      const overall = overallBar(t)
       const milestones = t.milestones?.items ?? []
       const running = runningRows(t)
       // Each non-empty group is one section; sections are separated by a blank line.
       const sections = [
-        [facts ? <Text dimColor>{facts}</Text> : null, t.summary && <Text>{t.summary}</Text>,
+        [facts ? <Text color="subtle">{facts}</Text> : null, t.summary && <Text>{t.summary}</Text>,
           t.error && <Text color="error">{t.error}</Text>],
         running,
-        [steps && <Text>{steps}</Text>, overall && <Text>{overall}</Text>],
-        milestones.length > 0 ? [<Text bold>Milestones</Text>, ...milestones.map(m => milestoneRow(t, m))] : [],
+        [steps && barRow(steps, 'success'), overall && barRow(overall, 'claude')],
+        milestones.length > 0 ? [heading('Milestones'), ...milestones.map(m => milestoneRow(t, m))] : [],
         t.steps.items.length > 0
-          ? [<Text bold>{t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'}</Text>,
+          ? [heading(t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'),
             ...t.steps.items.map(s => stepRow(t, s))]
           : [],
       ].filter(rows => rows.some(Boolean))
       return (
         <Box flexDirection="column" marginTop={index === 0 ? 1 : 2}>
           <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
-            {clip(`${isOpenTask ? '▾' : '▸'} ${t.id}`, width - 24)} <Text dimColor>{`${t.state}  ${headPercent(t)}`}</Text>
+            <Text color={color}>{isOpenTask ? '▾' : '▸'}</Text>{' '}
+            <Text bold>{clip(t.id, width - 26)}</Text> <Text color={color}>{t.state}</Text>
+            <Text dimColor>{`  ${headPercent(t)}`}</Text>
           </Button>
           {isOpenTask && (
             <Box flexDirection="column" paddingLeft={2}>
@@ -277,7 +340,7 @@ export const register: Register = on => {
     return (
       <Box flexDirection="column">
         <Button key="scope" plain onPress={() => update($, showAll, v => !v)}>
-          {all ? '[all tasks]' : '[this repo]'}
+          <Text color="suggestion">{all ? '[all tasks]' : '[this repo]'}</Text>
         </Button>
         {snap.error && <Text color="error">{snap.error}</Text>}
         {!snap.data && !snap.error && <Text dimColor>Loading…</Text>}

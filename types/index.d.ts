@@ -55,6 +55,7 @@ declare module 'claude-code' {
       showAll: boolean
       expanded: Record<string, boolean>
       dismissed: boolean
+      frame: number
     }
   }
 }
