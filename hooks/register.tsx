@@ -526,9 +526,14 @@ export const register: Register = on => {
       ]
     }
 
+    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+
     const taskBlock = (t: StatusTask, index: number) => {
       const key = `task:${t.id}`
-      const isOpenTask = isExpanded(key, t.in_cwd === true)
+      const isOpenTask = taskOpen(t)
+      // Folded tasks stack tight; an open task gets room around it.
+      const prev = tasks[index - 1]
+      const gap = index === 0 ? 1 : isOpenTask || (prev && taskOpen(prev)) ? 2 : 0
       const color = stateColor(t.state)
       const facts = [t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
       const name = all ? t.id : (t.slug ?? t.id)
@@ -539,7 +544,7 @@ export const register: Register = on => {
       const steps = t.steps.items
       const msDone = t.milestones?.total ? `${t.milestones.done}/${t.milestones.total} done` : undefined
       return (
-        <Box flexDirection="column" marginTop={index === 0 ? 1 : 2}>
+        <Box flexDirection="column" marginTop={gap}>
           <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
             <Text color={color}>{isOpenTask ? '▾' : '▸'}</Text>{' '}
             <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
