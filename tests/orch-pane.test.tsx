@@ -68,9 +68,9 @@ type Ran = { exitCode: number; stdout: string; stderr: string }
 type World = { runs: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran }
 
 // The engine beneath the plugin: env, cwd, the command, panes, and `orch status` itself.
-// `env` replaces the environment; a run whose argv[0] is in `absent` cannot start.
+// `env` replaces the environment.
 function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' },
-               env: Record<string, string> = { HOME: '/home/u' }, absent: string[] = []): World {
+               env: Record<string, string> = { HOME: '/home/u' }): World {
   const w: World = { runs: [], opens: 0, paneOpen: true, placed: true, result }
   mock.env(on, env)
   on('session.cwd', () => ({ value: '/proj' }))
@@ -87,7 +87,6 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
   }))
   on('process.run', (_, e) => {
     w.runs.push([...e.argv])
-    if (absent.includes(e.argv[0] ?? '')) throw new Error(`spawn ${e.argv[0]} ENOENT`)
     return { value: { ...w.result, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.complete', () => ({ text: '' }))
@@ -122,18 +121,14 @@ test('shows the repo task with bars, markers and the running line, on every surf
   }
 })
 
-test('on Windows it runs orch through the first Python launcher that starts, and keeps it', async ($, on) => {
+test('on Windows it runs orch through python from USERPROFILE, not HOME', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
-  const w = world(on, undefined, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u' }, ['py'])
+  const w = world(on, undefined, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u', HOME: '/c/Users/u' })
   await start($, clock)
-  const args = ['C:/Users/u/.claude/bin/orch', 'status', '--json', '--cwd', '/proj']
-  expect(w.runs).toEqual([['py', '-3', ...args], ['python', ...args]])
+  expect(w.runs).toEqual([['python', 'C:/Users/u/.claude/bin/orch', 'status', '--json', '--cwd', '/proj']])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /could not run/ })).toBeUndefined()
   await ui.unmount()
-  await clock.advance(8000)
-  await clock.settle()
-  expect(w.runs.slice(2)).toEqual([['python', ...args]])
 })
 
 test('the scope button shows and hides the other tasks', async ($, on) => {
