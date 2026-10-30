@@ -12,6 +12,9 @@ const PANE = 'orch-pane'
 const TITLE = 'Orchestration'
 const POLL_MS = 8000
 const RUN_TIMEOUT_MS = 10000
+// `orch` is a Python script. Elsewhere its #! line runs it; Windows does not honour that, so it goes through the
+// first interpreter that starts, kept for the session.
+const WIN_LAUNCHERS: readonly (readonly string[])[] = [['py', '-3'], ['python'], ['python3']]
 
 // Change the shape tag when Snapshot's fields change: a value an earlier version stored is then read as EMPTY.
 const EMPTY: Snapshot = { data: null, error: null, fetchedAt: null, okAt: null }
@@ -33,6 +36,7 @@ const FRAME_WRAP = 3600
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
 
 let inFlight = false
+let winLauncher = 0
 // The running Ask call's switch; a newer question or `clear` aborts it.
 let askStop: AbortController | null = null
 
@@ -69,19 +73,27 @@ async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
   inFlight = true
   try {
-    const home = await $.env.get('HOME')
+    const windows = (await $.env.get('OS')) === 'Windows_NT'
+    const home = (await $.env.get('HOME')) || (windows ? await $.env.get('USERPROFILE') : undefined)
     if (!home) {
-      await setError($, 'orch status could not run: HOME is not set')
+      await setError($, `orch status could not run: ${windows ? 'HOME and USERPROFILE are' : 'HOME is'} not set`)
       return null
     }
     const cwd = await $.session.cwd()
+    const argv = [`${home.replace(/\\/g, '/')}/.claude/bin/orch`, 'status', '--json', '--cwd', cwd]
     let ran
-    try {
-      ran = await $.process.run([`${home}/.claude/bin/orch`, 'status', '--json', '--cwd', cwd], {
-        timeoutMs: RUN_TIMEOUT_MS,
-      })
-    } catch (err) {
-      await setError($, `orch status could not run: ${errorText(err)}`)
+    let failure: unknown
+    for (let i = windows ? winLauncher : 0; i < (windows ? WIN_LAUNCHERS.length : 1); i++) {
+      try {
+        ran = await $.process.run(windows ? [...(WIN_LAUNCHERS[i] ?? []), ...argv] : argv, { timeoutMs: RUN_TIMEOUT_MS })
+        if (windows) winLauncher = i
+        break
+      } catch (err) {
+        failure = err
+      }
+    }
+    if (!ran) {
+      await setError($, `orch status could not run: ${errorText(failure)}`)
       return null
     }
     if (ran.exitCode !== 0) {
