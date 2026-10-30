@@ -4,6 +4,8 @@ A Claude Code pane beside the chat that shows the [orch](https://github.com/ijat
 
 Needs the `orch` CLI from [ijat/orch](https://github.com/ijat/orch) at `~/.claude/bin/orch` (the pane runs `orch status --json`).
 
+Works on macOS, Linux and Windows. On Windows the pane runs `orch` through Python (`py -3`, then `python`, then `python3`; the first that starts is kept), and finds `~` from `USERPROFILE` when `HOME` is unset.
+
 ## Install
 
 At the prompt of a terminal session:
