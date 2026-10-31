@@ -83,10 +83,11 @@ export type IndexStatus = {
   usage?: {
     window_days: number
     queries: number
-    by_command: Record<string, { n: number; p50_ms: number; p95_ms: number }>
+    by_command: Record<string, { n: number; p50_ms: number; p95_ms: number }> | null
     zero_hit_pct: number
     stale_answer_pct: number
-    label_mix: Record<string, number>
+    // null until a query carries a trust label (orch-index reports it so after a fresh index).
+    label_mix: Record<string, number> | null
     last_query_at: string | null
   } | null
 }
