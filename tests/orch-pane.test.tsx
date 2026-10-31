@@ -4,10 +4,11 @@ import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
   askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
-  overallTail, plainInput, scopeLabel, shimmer, sortByAttention, stepsTail, textKey,
+  bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, plainInput, scopeLabel, shimmer,
+  sortByAttention, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
-import type { StatusTask } from '../types'
+import type { IndexStatus, StatusTask } from '../types'
 
 const NOW = Date.parse('2026-10-29T10:30Z')
 
@@ -65,13 +66,30 @@ const OTHER = {
 const OUTPUT = JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: '/proj', tasks: [PROGRAM, OTHER] })
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
-type World = { runs: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran }
+type World = { runs: string[][]; indexRuns: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran; index: Ran }
+
+const INDEX: IndexStatus = {
+  schema: 1, state: 'stale', indexing: false, indexed_commit: '2a465daf7c7c8793', head_commit: 'd5eb5b06fbd77be7',
+  commits_behind: 3, indexed_at: '2026-10-29T10:27:00Z', db_bytes: 1503238554,
+  counts: { files: 485942, symbols: 1200000, refs: 9000000, includes: 800000, bases: 5000, names: 70000 },
+  parse_error_files: 12, parse_error_structural: 2, languages: { cpp: 400000, rust: 85942 },
+  last_index: { kind: 'incremental', seconds: 0.9, extracted: 200, reused: 485742, files_per_sec: 222.2 },
+  history: [
+    { at: '2026-10-29T10:27:00Z', kind: 'incremental', seconds: 0.9, extracted: 200 },
+    { at: '2026-10-29T09:00:00Z', kind: 'full', seconds: 9, extracted: 1000 },
+  ],
+  usage: {
+    window_days: 7, queries: 412, by_command: { def: { n: 200, p50_ms: 4, p95_ms: 31 } }, zero_hit_pct: 8,
+    stale_answer_pct: 12.5, label_mix: { resolved: 0.31, syntactic: 0.69 }, last_query_at: '2026-10-29T10:20:00Z',
+  },
+}
+const INDEX_RAN: Ran = { exitCode: 0, stdout: JSON.stringify(INDEX), stderr: '' }
 
 // The engine beneath the plugin: env, cwd, the command, panes, and `orch status` itself.
 // `env` replaces the environment.
 function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' },
                env: Record<string, string> = { HOME: '/home/u' }): World {
-  const w: World = { runs: [], opens: 0, paneOpen: true, placed: true, result }
+  const w: World = { runs: [], indexRuns: [], opens: 0, paneOpen: true, placed: true, result, index: INDEX_RAN }
   mock.env(on, env)
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -86,8 +104,10 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
       : [],
   }))
   on('process.run', (_, e) => {
-    w.runs.push([...e.argv])
-    return { value: { ...w.result, isStdoutTruncated: false, isStderrTruncated: false } }
+    const isIndex = e.argv.some(a => /orch-index(\.exe)?$/.test(a))
+    ;(isIndex ? w.indexRuns : w.runs).push([...e.argv])
+    const ran = isIndex ? w.index : w.result
+    return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.complete', () => ({ text: '' }))
   return w
@@ -103,6 +123,7 @@ test('shows the repo task with bars, markers and the running line, on every surf
   const w = world(on)
   await start($, clock)
   expect(w.runs).toEqual([['/home/u/.claude/bin/orch', 'status', '--json', '--cwd', '/proj']])
+  expect(w.indexRuns).toEqual([['/home/u/.claude/bin/orch-index', 'status', '--json', '--repo', '/proj']])
   expect(w.opens).toBe(1)
 
   for (const surface of ['terminal', 'desktop'] as const) {
@@ -126,6 +147,7 @@ test('on Windows it runs orch through python from USERPROFILE, not HOME', async 
   const w = world(on, undefined, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u', HOME: '/c/Users/u' })
   await start($, clock)
   expect(w.runs).toEqual([['python', 'C:/Users/u/.claude/bin/orch', 'status', '--json', '--cwd', '/proj']])
+  expect(w.indexRuns).toEqual([['C:/Users/u/.claude/bin/orch-index.exe', 'status', '--json', '--repo', '/proj']])
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect(await ui.find({ type: 'Text', text: /could not run/ })).toBeUndefined()
   await ui.unmount()
@@ -839,4 +861,94 @@ test('a summary left pending by a lost call expires, keeps the raw text, and is 
   expect(calls).toHaveLength(1)
   expect((await ui.find({ type: 'Text', text: /Second try/ }))?.text).toBe('✦ Second try.')
   await ui.unmount()
+})
+
+// -- code index -----------------------------------------------------------------------------------
+
+test('the Index section is folded under Goal and opens to the details', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'Index' })).toBeDefined()
+  expect((await ui.find({ type: 'Button', key: 'index:app/build' }))?.text).toBe('▸ stale · 3 behind · 1.4 GB · revised 3m ago  ⚠ stale answers')
+  expect(await ui.find({ type: 'Text', text: /contents/ })).toBeUndefined()
+  await ui.press({ key: 'index:app/build' })
+  expect((await ui.find({ type: 'Button', key: 'index:app/build' }))?.text).toMatch(/^▾ /)
+  expect((await ui.find({ type: 'Text', text: /^commit/ }))?.text).toMatch(/2a465daf7c · 3 commits behind HEAD/)
+  expect(await ui.find({ type: 'Text', text: /d5eb5b06fb/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /485,942 files/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /p50 4 ms · p95 31 ms/ })).toBeDefined()
+  await ui.press({ key: 'index:app/build' })
+  expect(await ui.find({ type: 'Text', text: /contents/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('the Index section is left out of tasks of other folders', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'scope' })
+  await ui.press({ key: 'task:other/fix' })
+  expect(await ui.find({ type: 'Button', key: 'goal:other/fix' })).toBeDefined()
+  expect(await ui.find({ type: 'Button', key: 'index:other/fix' })).toBeUndefined()
+  expect(await ui.find({ type: 'Button', key: 'index:app/build' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a missing orch-index says so, and a bad answer says why', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on)
+  w.index = { exitCode: 127, stdout: '', stderr: '' }
+  await start($, clock)
+  let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /orch-index/ }))?.text).toBe('orch-index is not installed')
+  expect(await ui.find({ type: 'Text', text: /Loading|could not run/ })).toBeUndefined()
+  await ui.unmount()
+
+  w.index = { exitCode: 1, stdout: '', stderr: 'error: not a git repository\nmore' }
+  await clock.advance(8000)
+  ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect((await ui.find({ type: 'Text', text: /orch-index/ }))?.text).toBe('orch-index failed: error: not a git repository')
+  await ui.unmount()
+})
+
+test('indexLook words the state as latest, stale, outdated or not built', () => {
+  const look = (o: Partial<IndexStatus>) => indexLook({ ...INDEX, ...o })
+  expect(look({ state: 'current' })).toEqual({ color: 'success', words: 'latest' })
+  expect(look({ state: 'stale', commits_behind: 1 }).words).toBe('stale · 1 behind')
+  expect(look({ state: 'stale', commits_behind: null }).words).toBe('stale')
+  expect(look({ state: 'outdated' })).toEqual({ color: 'warning', words: 'outdated' })
+  expect(look({ state: 'none' })).toEqual({ color: 'error', words: 'not built' })
+  expect(look({ state: 'current', indexing: true }).words).toBe('indexing…')
+})
+
+test('index sizes, headline, sparkline and parsing', () => {
+  expect(bytesText(512)).toBe('512 B')
+  expect(bytesText(675840)).toBe('660 KB')
+  expect(bytesText(1503238554)).toBe('1.4 GB')
+  expect(indexHeadline(INDEX, NOW)).toBe('1.4 GB · revised 3m ago')
+  expect(indexHeadline({ ...INDEX, db_bytes: null, indexed_at: null }, NOW)).toBe('')
+  expect(sparkline([1, 8])).toBe('▂█')
+  expect(sparkline([0, 0])).toBe('▁▁')
+  expect(parseIndex(JSON.stringify(INDEX))?.state).toBe('stale')
+  expect(parseIndex('{"schema":2,"state":"current"}')).toBeNull()
+  expect(parseIndex('{"schema":1,"state":"weird"}')).toBeNull()
+  expect(parseIndex('nope')).toBeNull()
+})
+
+test('indexDetails reports only what the index gives, and the fix when not current', () => {
+  const none = indexDetails({ ...INDEX, state: 'none' }, NOW).map(r => r.text)
+  expect(none).toEqual(['not built', 'run `orch-index index`'])
+  const lean: IndexStatus = {
+    schema: 1, state: 'current', indexing: false, indexed_commit: 'abc', head_commit: 'abc', commits_behind: 0,
+    indexed_at: null, db_bytes: null, counts: null, parse_error_files: 0, parse_error_structural: 0,
+  }
+  expect(indexDetails(lean, NOW).map(r => r.label)).toEqual(['commit'])
+  const rows = indexDetails({ ...INDEX, state: 'outdated', extractor_version: '8', binary_extractor_version: '9' }, NOW)
+  expect(rows.find(r => r.label === 'extractor')?.text).toBe('built by v8, this orch-index is v9')
+  expect(rows.find(r => r.label === 'answers')?.warn).toBe(true)
+  expect(rows.find(r => r.label === 'run time')?.text).toMatch(/^█▂  last 2 runs, slowest 9\.0 s/)
+  expect(rows.at(-1)?.label).toBe('fix')
 })
