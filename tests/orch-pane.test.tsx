@@ -951,4 +951,9 @@ test('indexDetails reports only what the index gives, and the fix when not curre
   expect(rows.find(r => r.label === 'answers')?.warn).toBe(true)
   expect(rows.find(r => r.label === 'run time')?.text).toMatch(/^█▂  last 2 runs, slowest 9\.0 s/)
   expect(rows.at(-1)?.label).toBe('fix')
+  // A fresh index with one unlabelled query reports label_mix (and possibly by_command) as null.
+  const fresh = { ...INDEX, state: 'current' as const, usage: { ...INDEX.usage!, queries: 1, label_mix: null, by_command: null } }
+  const freshRows = indexDetails(fresh, NOW)
+  expect(freshRows.find(r => r.label === 'answers')).toBeDefined()
+  expect(freshRows.find(r => r.label === 'trust')).toBeUndefined()
 })
