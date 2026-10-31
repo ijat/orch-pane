@@ -1,6 +1,6 @@
 {
   "name": "orch-pane",
-  "version": "0.2.2",
+  "version": "0.3.0",
   "description": "A pane beside the chat showing the orchestration tasks of this repo: state, what runs now, step and overall progress, with Haiku plain-language summaries and an Ask box",
   "types": "./types/index.d.ts"
 }
