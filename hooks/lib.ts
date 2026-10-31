@@ -203,11 +203,11 @@ export function indexDetails(ix: IndexStatus, now: number | null): DetailRow[] {
   const u = ix.usage
   if (u && u.queries > 0) {
     rows.push({ label: 'queries', text: `${count(u.queries)} in ${u.window_days}d${u.last_query_at ? ` · last ${ago(u.last_query_at, now) ?? u.last_query_at}` : ''}` })
-    for (const [name, v] of Object.entries(u.by_command).sort((a, b) => b[1].n - a[1].n)) {
+    for (const [name, v] of Object.entries(u.by_command ?? {}).sort((a, b) => b[1].n - a[1].n)) {
       rows.push({ label: `  ${name}`, text: `${count(v.n)} · p50 ${v.p50_ms} ms · p95 ${v.p95_ms} ms` })
     }
     rows.push({ label: 'answers', text: `${pct(u.zero_hit_pct)} empty · ${pct(u.stale_answer_pct)} from a stale index`, ...(indexNeedsAnswerWarning(ix) ? { warn: true as const } : {}) })
-    const mix = Object.entries(u.label_mix).filter(([, f]) => f > 0).sort((a, b) => b[1] - a[1])
+    const mix = Object.entries(u.label_mix ?? {}).filter(([, f]) => f > 0).sort((a, b) => b[1] - a[1])
     if (mix.length) rows.push({ label: 'trust', text: mix.map(([k, f]) => `${k.replace('_', '-')} ${pct(Math.round(f * 100))}`).join(' · ') })
   }
   if (ix.state !== 'current') rows.push({ label: 'fix', text: 'run `orch-index index`' })
