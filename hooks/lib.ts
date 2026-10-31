@@ -1,5 +1,5 @@
 // Pure logic of the pane: no `$`, no JSX. register.tsx draws with it; the tests call it directly.
-import type { StatusTask } from '../types'
+import type { IndexStatus, StatusTask } from '../types'
 
 // -- small text helpers ---------------------------------------------------------------------------
 
@@ -98,6 +98,121 @@ export function sortByAttention(tasks: readonly StatusTask[], now: number | null
 
 export const scopeLabel = (all: boolean, elsewhere: number) =>
   all ? '[all tasks]' : elsewhere > 0 ? `[this repo · ${elsewhere} elsewhere]` : '[this repo]'
+
+// -- code index -----------------------------------------------------------------------------------
+
+export const STALE_ANSWER_WARN = 10
+
+// Bytes as "660 KB", "1.4 GB".
+export function bytesText(n: number): string {
+  const units = ['B', 'KB', 'MB', 'GB', 'TB']
+  let v = n
+  let u = 0
+  while (v >= 1024 && u < units.length - 1) {
+    v /= 1024
+    u++
+  }
+  return u === 0 ? `${Math.round(v)} B` : `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[u]}`
+}
+
+export const secondsText = (s: number) => (s < 1 ? `${Math.round(s * 1000)} ms` : s < 60 ? `${s.toFixed(1)} s` : `${Math.floor(s / 60)}m ${Math.round(s % 60)}s`)
+
+// `orch-index status --json` output → IndexStatus, or null when it is not schema 1.
+export function parseIndex(text: string): IndexStatus | null {
+  try {
+    const v = JSON.parse(text) as Partial<IndexStatus> | null
+    const states = ['none', 'current', 'stale', 'outdated']
+    return v && v.schema === 1 && typeof v.state === 'string' && states.includes(v.state) ? (v as IndexStatus) : null
+  } catch {
+    return null
+  }
+}
+
+// Theme key and words for the index state: latest / stale / outdated / not built.
+export function indexLook(ix: IndexStatus): { color: string; words: string } {
+  if (ix.indexing) return { color: 'claude', words: 'indexing…' }
+  switch (ix.state) {
+    case 'current':
+      return { color: 'success', words: 'latest' }
+    case 'stale':
+      return { color: 'warning', words: ix.commits_behind ? `stale · ${ix.commits_behind} behind` : 'stale' }
+    case 'outdated':
+      return { color: 'warning', words: 'outdated' }
+    default:
+      return { color: 'error', words: 'not built' }
+  }
+}
+
+export const indexNeedsAnswerWarning = (ix: IndexStatus) => (ix.usage?.stale_answer_pct ?? 0) > STALE_ANSWER_WARN
+
+// The collapsed row's facts: size and how long ago it was revised.
+export function indexHeadline(ix: IndexStatus, now: number | null): string {
+  const parts = [ix.db_bytes === null ? null : bytesText(ix.db_bytes), ix.indexed_at ? `revised ${ago(ix.indexed_at, now) ?? ix.indexed_at}` : null]
+  return parts.filter(Boolean).join(' · ')
+}
+
+const SPARK = '▁▂▃▄▅▆▇█'
+
+// One block per run, oldest first, scaled to the slowest.
+export function sparkline(values: readonly number[]): string {
+  const max = Math.max(...values)
+  if (values.length === 0 || !(max > 0)) return SPARK[0]!.repeat(values.length)
+  return values.map(v => SPARK[clamp(Math.round((v / max) * (SPARK.length - 1)), 0, SPARK.length - 1)]).join('')
+}
+
+const count = (n: number) => n.toLocaleString('en-US')
+
+const pct = (n: number) => `${Number.isInteger(n) ? n : n.toFixed(1)}%`
+
+export type DetailRow = { label: string; text: string; warn?: true }
+
+// The expanded section's rows; each omitted when the index does not report it.
+export function indexDetails(ix: IndexStatus, now: number | null): DetailRow[] {
+  const rows: DetailRow[] = []
+  const short = (sha: string | null) => (sha ? sha.slice(0, 10) : null)
+  if (ix.state === 'none') {
+    rows.push({ label: 'index', text: 'not built', warn: true }, { label: 'fix', text: 'run `orch-index index`' })
+    return rows
+  }
+  if (ix.indexed_commit) {
+    const behind = ix.state === 'stale' ? (ix.commits_behind ? ` · ${ix.commits_behind} commit${ix.commits_behind === 1 ? '' : 's'} behind HEAD ${short(ix.head_commit)}` : ` · HEAD is ${short(ix.head_commit)}`) : ''
+    rows.push({ label: 'commit', text: `${short(ix.indexed_commit)}${behind}` })
+  }
+  if (ix.state === 'outdated') {
+    rows.push({ label: 'extractor', text: `built by v${ix.extractor_version ?? '?'}, this orch-index is v${ix.binary_extractor_version ?? '?'}`, warn: true })
+  }
+  if (ix.indexed_at) rows.push({ label: 'revised', text: `${ago(ix.indexed_at, now) ?? ix.indexed_at} · ${ix.indexed_at}` })
+  if (ix.counts) {
+    const c = ix.counts
+    rows.push({ label: 'contents', text: `${count(c.files)} files · ${count(c.symbols)} symbols · ${count(c.refs)} refs · ${count(c.includes)} includes` })
+  }
+  const langs = Object.entries(ix.languages ?? {}).sort((a, b) => b[1] - a[1])
+  if (langs.length) rows.push({ label: 'languages', text: langs.map(([k, n]) => `${k} ${count(n)}`).join(' · ') })
+  if (ix.parse_error_files) {
+    rows.push({ label: 'parse errors', text: `${count(ix.parse_error_files)} files, ${count(ix.parse_error_structural ?? 0)} at declaration level`, warn: true })
+  }
+  const last = ix.last_index
+  if (last) {
+    const rate = last.files_per_sec ? ` · ${Math.round(last.files_per_sec)} files/s` : ''
+    rows.push({ label: 'last run', text: `${last.kind} · ${secondsText(last.seconds)} · ${count(last.extracted)} extracted${last.reused !== undefined ? `, ${count(last.reused)} reused` : ''}${rate}` })
+  }
+  if (ix.history && ix.history.length > 1) {
+    const runs = [...ix.history].reverse()
+    rows.push({ label: 'run time', text: `${sparkline(runs.map(h => h.seconds))}  last ${runs.length} runs, slowest ${secondsText(Math.max(...runs.map(h => h.seconds)))}` })
+  }
+  const u = ix.usage
+  if (u && u.queries > 0) {
+    rows.push({ label: 'queries', text: `${count(u.queries)} in ${u.window_days}d${u.last_query_at ? ` · last ${ago(u.last_query_at, now) ?? u.last_query_at}` : ''}` })
+    for (const [name, v] of Object.entries(u.by_command).sort((a, b) => b[1].n - a[1].n)) {
+      rows.push({ label: `  ${name}`, text: `${count(v.n)} · p50 ${v.p50_ms} ms · p95 ${v.p95_ms} ms` })
+    }
+    rows.push({ label: 'answers', text: `${pct(u.zero_hit_pct)} empty · ${pct(u.stale_answer_pct)} from a stale index`, ...(indexNeedsAnswerWarning(ix) ? { warn: true as const } : {}) })
+    const mix = Object.entries(u.label_mix).filter(([, f]) => f > 0).sort((a, b) => b[1] - a[1])
+    if (mix.length) rows.push({ label: 'trust', text: mix.map(([k, f]) => `${k.replace('_', '-')} ${pct(Math.round(f * 100))}`).join(' · ') })
+  }
+  if (ix.state !== 'current') rows.push({ label: 'fix', text: 'run `orch-index index`' })
+  return rows
+}
 
 // -- markdown-lite --------------------------------------------------------------------------------
 

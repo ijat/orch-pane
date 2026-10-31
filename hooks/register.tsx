@@ -1,10 +1,11 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AskState, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
+import type { AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
 import {
-  ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, isRunning, isStale, lastActivity,
-  mdLite, overallTail, plainInput, scopeLabel, shimmer, sortByAttention, stateColor, stepsTail, stripMarks, textKey,
+  ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
+  indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, plainInput,
+  scopeLabel, shimmer, sortByAttention, stateColor, stepsTail, stripMarks, textKey,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -15,8 +16,8 @@ const RUN_TIMEOUT_MS = 10000
 // `orch` is a Python script. Elsewhere its #! line runs it; Windows does not honour that, so it runs through `python`.
 
 // Change the shape tag when Snapshot's fields change: a value an earlier version stored is then read as EMPTY.
-const EMPTY: Snapshot = { data: null, error: null, fetchedAt: null, okAt: null }
-const snapshot = atom({ plugin: 'orch-pane', key: 'snapshot' } as const, EMPTY, { shape: 'snap-2' })
+const EMPTY: Snapshot = { data: null, error: null, fetchedAt: null, okAt: null, index: null, indexNote: null }
+const snapshot = atom({ plugin: 'orch-pane', key: 'snapshot' } as const, EMPTY, { shape: 'snap-3' })
 const showAll = atom({ plugin: 'orch-pane', key: 'showAll' } as const, false)
 const expanded = atom({ plugin: 'orch-pane', key: 'expanded' } as const, {} as Record<string, boolean>)
 const dismissed = atom({ plugin: 'orch-pane', key: 'dismissed' } as const, false)
@@ -65,6 +66,28 @@ async function setError($: EngineInterface, error: string) {
   await update($, snapshot, s => ({ ...(s ?? EMPTY), error, fetchedAt }))
 }
 
+// Runs `orch-index status --json` for the session folder. It is a native binary beside `orch`; a missing one
+// or a failure leaves a note and the last good index stays out of sight (an old index would mislead).
+async function fetchIndex($: EngineInterface, home: string, windows: boolean, cwd: string) {
+  const bin = `${home.replace(/\\/g, '/')}/.claude/bin/orch-index${windows ? '.exe' : ''}`
+  const set = (index: IndexStatus | null, indexNote: string | null) =>
+    update($, snapshot, s => ({ ...(s ?? EMPTY), index, indexNote }))
+  let ran
+  try {
+    ran = await $.process.run([bin, 'status', '--json', '--repo', cwd], { timeoutMs: RUN_TIMEOUT_MS })
+  } catch (err) {
+    const text = errorText(err)
+    await set(null, /ENOENT|not found|no such file/i.test(text) ? 'orch-index is not installed' : `orch-index could not run: ${text}`)
+    return
+  }
+  if (ran.exitCode !== 0) {
+    await set(null, ran.exitCode === 127 ? 'orch-index is not installed' : `orch-index failed: ${firstLine(ran.stderr) || `exit ${ran.exitCode}`}`)
+    return
+  }
+  const index = parseIndex(ran.stdout)
+  await set(index, index ? null : 'orch-index status: unsupported output (expected schema 1)')
+}
+
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
 async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
@@ -104,7 +127,8 @@ async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
       return null
     }
     const fetchedAt = await $.clock.now()
-    await update($, snapshot, () => ({ data, error: null, fetchedAt, okAt: fetchedAt }))
+    await update($, snapshot, s => ({ ...(s ?? EMPTY), data, error: null, fetchedAt, okAt: fetchedAt }))
+    await fetchIndex($, home, windows, cwd)
     return data
   } finally {
     inFlight = false
@@ -553,6 +577,38 @@ export const register: Register = on => {
       ]
     }
 
+    // The code index of this folder, folded to one line (state, size, when it was revised); open, its details.
+    const indexRows = (t: StatusTask) => {
+      if (t.in_cwd !== true) return []
+      const ix = snap.index
+      if (!ix) return snap.indexNote ? [<Text dimColor>{clip(snap.indexNote, room)}</Text>] : []
+      const look = indexLook(ix)
+      const isOpenIndex = isExpanded('index')
+      const head = indexHeadline(ix, now)
+      const rows = indexDetails(ix, now)
+      const labelW = Math.max(0, ...rows.map(r => r.label.length)) + 2
+      return [
+        <Button key={`index:${t.id}`} plain onPress={toggle('index')}>
+          <Text color="subtle">{isOpenIndex ? '▾ ' : '▸ '}</Text>
+          <Text color={look.color} bold>{look.words}</Text>
+          {head ? <Text dimColor>{clip(` · ${head}`, Math.max(8, room - 2 - look.words.length))}</Text> : null}
+          {indexNeedsAnswerWarning(ix) ? <Text color="warning">{'  ⚠ stale answers'}</Text> : null}
+        </Button>,
+        isOpenIndex ? (
+          <Box flexDirection="column" paddingLeft={2}>
+            {rows.flatMap(r => mdLite(r.text, Math.max(12, room - 2 - labelW)).map((l, i) => (
+              <Text>
+                <Text dimColor>{(i === 0 ? r.label : '').padEnd(labelW)}</Text>
+                <Text color={r.warn ? 'warning' : undefined}>
+                  {l.runs.map(x => <Text color={x.code ? 'permission' : undefined}>{x.text}</Text>)}
+                </Text>
+              </Text>
+            )))}
+          </Box>
+        ) : null,
+      ]
+    }
+
     const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
 
     const taskBlock = (t: StatusTask, index: number) => {
@@ -584,6 +640,7 @@ export const register: Register = on => {
             <Box flexDirection="column" paddingLeft={2}>
               {facts ? <Text color="subtle">{facts}</Text> : null}
               {section('Goal', goalRows(t))}
+              {section('Index', indexRows(t))}
               {section('Now', nowRows(t))}
               {section('Progress', progress.map(b => barRow(t, b, layout)))}
               {milestones.length > 0
