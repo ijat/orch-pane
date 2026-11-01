@@ -107,7 +107,12 @@ export type Snapshot = {
   okAt: number | null
   index: IndexStatus | null
   indexNote: string | null
+  about?: About | null
 }
+
+// One installed part: version and commit, or `installed: false`. commit is null when the part does not record one.
+export type AboutPart = { name: string; installed: boolean; version: string | null; commit: string | null }
+export type About = AboutPart[]
 
 // A plain-language summary, by the cache key of the text it summarises.
 export type PlainEntry = { state: 'pending'; at: number } | { state: 'done'; text: string } | { state: 'error'; reason: string }
