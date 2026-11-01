@@ -30,6 +30,8 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Tasks that need you (open questions, an error, or work that stalled for over 30 minutes) come first. Each task shows its Goal (one line; click to open), Now (what runs and the last activity), Progress, and its Milestones and Steps, folded around the current one; click a fold row to see them all.
 
+An About section under Ask lists the version and commit of the orch skill, orch-index and this plugin, or `not installed`. The index records no commit, so it shows its version only. It is read once per session and again on `/orch-pane`.
+
 When a running agent reports its own progress (`pct`, 0 to 99, in `orch status --json`), a bar under its name shows it: the same width as the Steps bar, in the agent's colour, animated while it runs. An agent that has not reported gets no bar.
 
 Opening a goal, milestone or step also asks Haiku (lowest effort) for a plain-language summary of it, once per text: summaries are kept in the mod's own store across sessions. The `raw` button shows the original text.

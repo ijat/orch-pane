@@ -104,6 +104,13 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
       : [],
   }))
   on('process.run', (_, e) => {
+    // The About probes: `--version` of orch and orch-index, and a python one-liner for the two JSON files.
+    if (e.argv.includes('--version') || e.argv.includes('-c')) {
+      const out = e.argv.includes('-c')
+        ? (e.argv.at(-1)?.endsWith('installed_plugins.json') ? '0.5.1 abc1234def' : '611c4fa7ed')
+        : e.argv[0]?.includes('orch-index') ? 'orch-index 0.2.0' : 'orch 0.1.0'
+      return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const isIndex = e.argv.some(a => /orch-index(\.exe)?$/.test(a))
     ;(isIndex ? w.indexRuns : w.runs).push([...e.argv])
     const ran = isIndex ? w.index : w.result
@@ -1052,4 +1059,18 @@ test('placeText names the repo and marks a worktree', () => {
   expect(placeText(t)).toBe('app · [WT] orch-x')
   expect(placeText({ ...t, worktree: null })).toBe('app')
   expect(placeText({ ...t, repo: null, worktree: null })).toBe('app')
+})
+
+test('About lists the version and commit of the skill, index and pane', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const all = (await ui.findAll({ type: 'Text', text: /./ })).map(t => t.text).join('\n')
+  expect(all).toContain('About')
+  expect(all).toContain('v0.1.0')
+  expect(all).toContain('611c4fa')
+  expect(all).toContain('v0.2.0')
+  expect(all).toContain('v0.5.1')
+  expect(all).toContain('abc1234')
 })

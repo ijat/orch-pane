@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
+import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
 import {
   agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
@@ -17,7 +17,7 @@ const RUN_TIMEOUT_MS = 10000
 
 // Change the shape tag when Snapshot's fields change: a value an earlier version stored is then read as EMPTY.
 const EMPTY: Snapshot = { data: null, error: null, fetchedAt: null, okAt: null, index: null, indexNote: null }
-const snapshot = atom({ plugin: 'orch-pane', key: 'snapshot' } as const, EMPTY, { shape: 'snap-3' })
+const snapshot = atom({ plugin: 'orch-pane', key: 'snapshot' } as const, EMPTY, { shape: 'snap-4' })
 const showAll = atom({ plugin: 'orch-pane', key: 'showAll' } as const, false)
 const expanded = atom({ plugin: 'orch-pane', key: 'expanded' } as const, {} as Record<string, boolean>)
 const dismissed = atom({ plugin: 'orch-pane', key: 'dismissed' } as const, false)
@@ -88,6 +88,36 @@ async function fetchIndex($: EngineInterface, home: string, windows: boolean, cw
   await set(index, index ? null : 'orch-index status: unsupported output (expected schema 1)')
 }
 
+const PY = (windows: boolean) => (windows ? 'python' : 'python3')
+const PICK = 'import json,sys\nd=json.load(open(sys.argv[1]))\n'
+
+// Version and commit of the three parts: the orch skill (`orch --version`; the commit it was synced from is
+// in ~/.claude/.orch-sync/manifest.json), orch-index (`--version`; the binary records no commit) and this plugin
+// (installed_plugins.json). A part that does not run or is not listed is "not installed".
+async function fetchAbout($: EngineInterface, home: string, windows: boolean): Promise<About> {
+  const h = home.replace(/\\/g, '/')
+  const run = async (argv: string[]) => {
+    try {
+      const r = await $.process.run(argv, { timeoutMs: RUN_TIMEOUT_MS })
+      return r.exitCode === 0 ? r.stdout.trim() : null
+    } catch {
+      return null
+    }
+  }
+  const ver = (out: string | null) => out?.match(/(\d+\.\d+\.\d+\S*)/)?.[1] ?? null
+  const py = PY(windows)
+  const [skillV, skillC, indexV, pane] = await Promise.all([
+    run([...(windows ? ['python'] : []), `${h}/.claude/bin/orch`, '--version']),
+    run([py, '-c', `${PICK}print(d['rev'])`, `${h}/.claude/.orch-sync/manifest.json`]),
+    run([`${h}/.claude/bin/orch-index${windows ? '.exe' : ''}`, '--version']),
+    run([py, '-c', `${PICK}e=d['plugins'].get('orch-pane@orch-pane')\nif e: print(e[0]['version'], e[0].get('gitCommitSha',''))`, `${h}/.claude/plugins/installed_plugins.json`]),
+  ])
+  const [paneV, paneC] = pane ? pane.split(/\s+/) : [null, null]
+  const part = (name: string, version: string | null, commit: string | null): AboutPart =>
+    ({ name, installed: version !== null, version, commit: version !== null && commit ? commit.slice(0, 7) : null })
+  return [part('orch skill', ver(skillV), skillC), part('orch-index', ver(indexV), null), part('orch-pane', paneV ?? null, paneC ?? null)]
+}
+
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
 async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
@@ -129,6 +159,11 @@ async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
     const fetchedAt = await $.clock.now()
     await update($, snapshot, s => ({ ...(s ?? EMPTY), data, error: null, fetchedAt, okAt: fetchedAt }))
     await fetchIndex($, home, windows, cwd)
+    // Versions change only on an install: read them once per session (and again after /orch-pane).
+    if (!(await read($, snapshot))?.about) {
+      const about = await fetchAbout($, home, windows)
+      await update($, snapshot, s => ({ ...(s ?? EMPTY), about }))
+    }
     return data
   } finally {
     inFlight = false
@@ -316,6 +351,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'orch-pane' }, async $ => {
     await update($, dismissed, () => false)
+    await update($, snapshot, s => ({ ...(s ?? EMPTY), about: null }))
     await $.ui.open({ id: PANE, title: TITLE })
     await fetchStatus($)
 
@@ -702,6 +738,25 @@ export const register: Register = on => {
       )
     }
 
+    const aboutRows = () => {
+      if (!snap.about) return null
+      return (
+        <Box flexDirection="column" marginTop={2}>
+          <Text bold color="suggestion">About</Text>
+          <Box flexDirection="column" paddingLeft={2}>
+            {snap.about.map(p => (
+              <Text key={p.name}>
+                <Text dimColor>{p.name.padEnd(11)}</Text>
+                {p.installed
+                  ? <Text>{`v${p.version}`}{p.commit ? <Text dimColor>{`  ${p.commit}`}</Text> : null}</Text>
+                  : <Text color="warning">not installed</Text>}
+              </Text>
+            ))}
+          </Box>
+        </Box>
+      )
+    }
+
     return (
       <Box flexDirection="column">
         <Button key="scope" plain onPress={() => update($, showAll, v => !v)}>
@@ -713,6 +768,7 @@ export const register: Register = on => {
         {empty && <Text dimColor>{empty}</Text>}
         {tasks.map(taskBlock)}
         {askRows()}
+        {aboutRows()}
       </Box>
     )
   })
