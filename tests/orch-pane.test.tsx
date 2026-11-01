@@ -4,7 +4,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
   askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
-  bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, plainInput, scopeLabel, shimmer,
+  bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
@@ -956,4 +956,11 @@ test('indexDetails reports only what the index gives, and the fix when not curre
   const freshRows = indexDetails(fresh, NOW)
   expect(freshRows.find(r => r.label === 'answers')).toBeDefined()
   expect(freshRows.find(r => r.label === 'trust')).toBeUndefined()
+})
+
+test('placeText names the repo and marks a worktree', () => {
+  const t = { repo: 'app', repo_path: '/p/app', worktree: '/p/app/.claude/worktrees/orch-x' } as StatusTask
+  expect(placeText(t)).toBe('app · [WT] orch-x')
+  expect(placeText({ ...t, worktree: null })).toBe('app')
+  expect(placeText({ ...t, repo: null, worktree: null })).toBe('app')
 })
