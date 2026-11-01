@@ -3,12 +3,12 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
-  askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
+  agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
-import type { IndexStatus, StatusTask } from '../types'
+import type { IndexStatus, StatusRole, StatusTask } from '../types'
 
 const NOW = Date.parse('2026-10-29T10:30Z')
 
@@ -376,6 +376,33 @@ test('shimmer moves one cell per frame and repeats', () => {
   }
 })
 
+test('agentPct accepts only integers 0-99', () => {
+  const r = (pct: unknown): StatusRole => ({ role: 'implementer', state: 'in_progress', step: null, note: null, pct } as StatusRole)
+  expect(agentPct(r(40))).toBe(40)
+  expect(agentPct(r(0))).toBe(0)
+  expect(agentPct(r(99))).toBe(99)
+  for (const bad of [undefined, null, -1, 100, 12.5, NaN, Infinity, '40']) expect(agentPct(r(bad))).toBeNull()
+  expect(agentPct({ role: null, state: null, step: null, note: null })).toBeNull()
+  expect(agentPctTail(40)).toBe(' 40%')
+  expect(agentPctTail(0)).toBe('  0%')
+  expect(agentPctTail(99)).toBe(' 99%')
+})
+
+test('agent palettes follow the role base name, and shimmer defaults to green', () => {
+  const green = agentPalette('implementer')
+  expect(agentPalette('implementer:ui')).toBe(green)
+  expect(agentPalette(null)).toBe(green)
+  expect(agentPalette('orchestrator')).toBe(green)
+  expect(agentPalette('planner')).not.toBe(green)
+  expect(agentPalette('code-reviewer:a')).toBe(agentPalette('code-reviewer'))
+  expect(shimmer(12, 7)).toEqual(shimmer(12, 7, green))
+  // Frame 12 puts the highlight at cell 9 of 12: cell 0 is the plain dark end.
+  expect(shimmer(12, 12, agentPalette('code-reviewer'))[0]).toBe('#0891b2')
+  expect(shimmer(12, 12)[0]).toBe('#16a34a')
+  expect(shimmer(12, 7, agentPalette('planner'))).not.toEqual(shimmer(12, 7))
+  expect(shimmer(12, 12, agentPalette('toString'))[0]).toBe('#16a34a')
+})
+
 const T0 = Date.parse('2026-10-29T10:00Z')
 const task = (over: Partial<StatusTask>): StatusTask => ({
   id: 'r/t', repo: 'r', slug: 't', task_dir: null, repo_path: null, worktree: null, in_cwd: true,
@@ -568,18 +595,16 @@ test('a long step list folds around the current step and opens on press', async 
 })
 
 const stepColours = async (ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ props: Record<string, unknown> }[]> }) =>
-  (await ui.findAll({ type: 'Text', text: /^█+$/ })).map(t => String(t.props.color)).filter(c => c !== 'claude')
+  (await ui.findAll({ type: 'Text', text: /^█+$/ })).map(t => String(t.props.color)).filter(c => c === 'success')
 
-test('the Steps bar shimmers while a role runs and is plain when idle', async ($, on) => {
+test('the Steps bar stays one plain colour while a role runs', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   world(on)
   await start($, clock)
   const ui = await $.ui.mount(PANE60('terminal'))
-  const a = await stepColours(ui)
-  expect(a.every(c => /^#[0-9a-f]{6}$/.test(c))).toBe(true)
+  expect(await stepColours(ui)).toEqual(['success'])
   await clock.advance(120)
-  const b = await stepColours(ui)
-  expect(b).not.toEqual(a)
+  expect(await stepColours(ui)).toEqual(['success'])
   // The Overall bar stays one theme colour.
   expect((await ui.findAll({ type: 'Text', text: /^█+$/ })).filter(t => t.props.color === 'claude')).toHaveLength(1)
   await ui.unmount()
@@ -594,6 +619,70 @@ test('an idle task draws a plain Steps bar', async ($, on) => {
   expect(await stepColours(ui)).toEqual(['success'])
   await clock.advance(360)
   expect(await stepColours(ui)).toEqual(['success'])
+  await ui.unmount()
+})
+
+// -- per-agent progress bar -------------------------------------------------------------------------
+
+const withRoles = (...roles: { role: string; pct?: unknown }[]) => ({
+  ...PROGRAM,
+  running: {
+    ...PROGRAM.running,
+    roles: roles.map(r => ({ role: r.role, state: 'in_progress', step: null, note: null, ...('pct' in r ? { pct: r.pct } : {}) })),
+  },
+})
+const barLines = async (ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ text: string }[]> }) =>
+  (await ui.findAll({ type: 'Text', text: /^ {4}[█░]+ {2} *\d+%$/ })).map(t => t.text)
+
+test('a running agent that reports pct gets a bar under its name, as wide as the Steps bar', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: output(withRoles({ role: 'implementer', pct: 40 })), stderr: '' })
+  await start($, clock)
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount(PANE60(surface))
+    const lines = await barLines(ui)
+    expect(lines).toHaveLength(1)
+    expect(lines[0]).toMatch(/ {2} 40%$/)
+    const steps = (await ui.find({ type: 'Text', text: /M2 steps/ }))?.text ?? ''
+    const cells = (t: string) => [...t].filter(c => c === '█' || c === '░').length
+    expect(cells(lines[0] ?? '')).toBe(cells(steps))
+    // Order: name line, bar line, then the tail line.
+    const texts = (await ui.findAll({ type: 'Text', text: /./ })).map(t => t.text)
+    const name = texts.findIndex(t => /implementer/.test(t))
+    const bar = texts.indexOf(lines[0] ?? '')
+    const tail = texts.findIndex(t => /running /.test(t))
+    expect(name).toBeGreaterThanOrEqual(0)
+    expect(bar).toBeGreaterThan(name)
+    expect(tail).toBeGreaterThan(bar)
+    await ui.unmount()
+  }
+})
+
+test('an agent without a valid pct has no bar line', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: output(withRoles({ role: 'implementer' }, { role: 'planner', pct: 100 }, { role: 'code-reviewer', pct: null })), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(await barLines(ui)).toEqual([])
+  await ui.unmount()
+})
+
+test('two running agents each get a bar, in role order, in their own colour and animated', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: output(withRoles({ role: 'implementer', pct: 40 }, { role: 'code-reviewer:a', pct: 15 })), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const lines = await barLines(ui)
+  expect(lines).toHaveLength(2)
+  expect(lines[0]).toMatch(/ 40%$/)
+  expect(lines[1]).toMatch(/ 15%$/)
+  const filled = (l: string) => [...l].filter(c => c === '█').length
+  expect(filled(lines[0] ?? '')).toBeGreaterThan(filled(lines[1] ?? ''))
+  const colours = async () => (await ui.findAll({ type: 'Text', text: /^█+$/ })).map(t => String(t.props.color)).filter(c => c.startsWith('#'))
+  const before = await colours()
+  expect(before.length).toBeGreaterThan(0)
+  await clock.advance(120)
+  expect(await colours()).not.toEqual(before)
   await ui.unmount()
 })
 

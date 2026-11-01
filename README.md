@@ -30,6 +30,8 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 Tasks that need you (open questions, an error, or work that stalled for over 30 minutes) come first. Each task shows its Goal (one line; click to open), Now (what runs and the last activity), Progress, and its Milestones and Steps, folded around the current one; click a fold row to see them all.
 
+When a running agent reports its own progress (`pct`, 0 to 99, in `orch status --json`), a bar under its name shows it: the same width as the Steps bar, in the agent's colour, animated while it runs. An agent that has not reported gets no bar.
+
 Opening a goal, milestone or step also asks Haiku (lowest effort) for a plain-language summary of it, once per text: summaries are kept in the mod's own store across sessions. The `raw` button shows the original text.
 
 Under Goal, a task of the session's folder has an Index line: the code index's state (`latest`, `stale · N behind`, `outdated`, `not built`, or `indexing…`), its size, and when it was last revised. It is folded; click it for the indexed commit and how far HEAD is ahead, file/symbol/reference counts, languages, parse errors, the last run (kind, time, files per second, extracted vs reused) with a run-time sparkline, and the last 7 days of queries (p50/p95 per command, empty-answer %, stale-answer %, trust-label mix). A `⚠ stale answers` badge shows when over 10% of answers came from a stale index.

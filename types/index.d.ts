@@ -1,5 +1,11 @@
 // The part of `orch status --json` (schema 1) this mod reads. Missing data is null.
-export type StatusRole = { role: string | null; state: string | null; step: string | null; note: string | null }
+export type StatusRole = {
+  role: string | null
+  state: string | null
+  step: string | null
+  note: string | null
+  pct?: number | null
+}
 
 export type StatusSpawn = {
   ts: string | null
