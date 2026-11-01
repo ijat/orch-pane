@@ -96,6 +96,15 @@ export function sortByAttention(tasks: readonly StatusTask[], now: number | null
     .map(x => x.t)
 }
 
+const baseName = (p: string) => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? p
+
+// Where a task lives: "RznSans · [WT] orch-rznmono-0006" (the worktree's folder), or just the repo name.
+export function placeText(t: StatusTask): string {
+  const repo = t.repo ?? (t.repo_path ? baseName(t.repo_path) : null)
+  const wt = t.worktree ? `[WT] ${baseName(t.worktree)}` : null
+  return [repo, wt].filter(Boolean).join(' · ')
+}
+
 export const scopeLabel = (all: boolean, elsewhere: number) =>
   all ? '[all tasks]' : elsewhere > 0 ? `[this repo · ${elsewhere} elsewhere]` : '[this repo]'
 
