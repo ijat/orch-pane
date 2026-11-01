@@ -3,12 +3,12 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
-  askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
+  agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
-import type { IndexStatus, StatusTask } from '../types'
+import type { IndexStatus, StatusRole, StatusTask } from '../types'
 
 const NOW = Date.parse('2026-10-29T10:30Z')
 
@@ -374,6 +374,33 @@ test('shimmer moves one cell per frame and repeats', () => {
   for (const filled of [3, 5, 12, 24]) {
     for (let f = 0; f < filled + 7; f++) expect(shimmer(filled, f + 1)).not.toEqual(shimmer(filled, f))
   }
+})
+
+test('agentPct accepts only integers 0-99', () => {
+  const r = (pct: unknown): StatusRole => ({ role: 'implementer', state: 'in_progress', step: null, note: null, pct } as StatusRole)
+  expect(agentPct(r(40))).toBe(40)
+  expect(agentPct(r(0))).toBe(0)
+  expect(agentPct(r(99))).toBe(99)
+  for (const bad of [undefined, null, -1, 100, 12.5, NaN, Infinity, '40']) expect(agentPct(r(bad))).toBeNull()
+  expect(agentPct({ role: null, state: null, step: null, note: null })).toBeNull()
+  expect(agentPctTail(40)).toBe(' 40%')
+  expect(agentPctTail(0)).toBe('  0%')
+  expect(agentPctTail(99)).toBe(' 99%')
+})
+
+test('agent palettes follow the role base name, and shimmer defaults to green', () => {
+  const green = agentPalette('implementer')
+  expect(agentPalette('implementer:ui')).toBe(green)
+  expect(agentPalette(null)).toBe(green)
+  expect(agentPalette('orchestrator')).toBe(green)
+  expect(agentPalette('planner')).not.toBe(green)
+  expect(agentPalette('code-reviewer:a')).toBe(agentPalette('code-reviewer'))
+  expect(shimmer(12, 7)).toEqual(shimmer(12, 7, green))
+  // Frame 12 puts the highlight at cell 9 of 12: cell 0 is the plain dark end.
+  expect(shimmer(12, 12, agentPalette('code-reviewer'))[0]).toBe('#0891b2')
+  expect(shimmer(12, 12)[0]).toBe('#16a34a')
+  expect(shimmer(12, 7, agentPalette('planner'))).not.toEqual(shimmer(12, 7))
+  expect(shimmer(12, 12, agentPalette('toString'))[0]).toBe('#16a34a')
 })
 
 const T0 = Date.parse('2026-10-29T10:00Z')

@@ -1,5 +1,5 @@
 // Pure logic of the pane: no `$`, no JSX. register.tsx draws with it; the tests call it directly.
-import type { IndexStatus, StatusTask } from '../types'
+import type { IndexStatus, StatusRole, StatusTask } from '../types'
 
 // -- small text helpers ---------------------------------------------------------------------------
 
@@ -488,25 +488,45 @@ export const stepsTail = (percent: number, done: number, total: number) =>
 export const overallTail = (percent: number, estimate: boolean) =>
   `${percent}%`.padStart(4) + (estimate ? '  estimate' : '')
 
-// Gradient ends and the moving highlight of the running Steps bar.
-const DARK = [0x16, 0xa3, 0x4a] // #16a34a
-const LIGHT = [0x4a, 0xde, 0x80] // #4ade80
-const GLOW = [0xe0, 0xff, 0xec] // #e0ffec
+// A running agent's self-reported progress: an integer 0-99, anything else counts as not reported.
+export const agentPct = (r: StatusRole): number | null =>
+  typeof r.pct === 'number' && Number.isInteger(r.pct) && r.pct >= 0 && r.pct <= 99 ? r.pct : null
+
+export const agentPctTail = (p: number) => `${p}%`.padStart(4)
+
+// Gradient ends and the moving highlight of an agent's progress bar.
+type Palette = { dark: number[]; light: number[]; glow: number[] }
+const GREEN: Palette = { dark: [0x16, 0xa3, 0x4a], light: [0x4a, 0xde, 0x80], glow: [0xe0, 0xff, 0xec] } // #16a34a #4ade80 #e0ffec
+// By role base name; the colours of the `color:` in each ~/.claude/agents/orch-*.md.
+const PALETTES: Record<string, Palette> = {
+  implementer: GREEN,
+  planner: { dark: [0x93, 0x33, 0xea], light: [0xc0, 0x84, 0xfc], glow: [0xf3, 0xe8, 0xff] }, // #9333ea #c084fc #f3e8ff
+  'code-reviewer': { dark: [0x08, 0x91, 0xb2], light: [0x22, 0xd3, 0xee], glow: [0xe0, 0xfb, 0xff] }, // #0891b2 #22d3ee #e0fbff
+  'security-reviewer': { dark: [0xdc, 0x26, 0x26], light: [0xf8, 0x71, 0x71], glow: [0xff, 0xe4, 0xe4] }, // #dc2626 #f87171 #ffe4e4
+  'plan-reviewer': { dark: [0xca, 0x8a, 0x04], light: [0xfa, 0xcc, 0x15], glow: [0xff, 0xf9, 0xdb] }, // #ca8a04 #facc15 #fff9db
+  director: { dark: [0xc0, 0x26, 0xd3], light: [0xe8, 0x79, 0xf9], glow: [0xfd, 0xf0, 0xff] }, // #c026d3 #e879f9 #fdf0ff
+}
+
+export function agentPalette(role: string | null): Palette {
+  const base = (role ?? '').split(':')[0] ?? ''
+  return Object.hasOwn(PALETTES, base) ? PALETTES[base]! : GREEN
+}
+
 const RADIUS = 3.5
 
 const hex = (rgb: number[]) => `#${rgb.map(c => Math.round(c).toString(16).padStart(2, '0')).join('')}`
 const mix = (a: number[], b: number[], t: number) => a.map((c, i) => c + ((b[i] ?? c) - c) * t)
 
-// One colour per filled cell: a left→right green gradient with a highlight moving one cell per frame,
+// One colour per filled cell: a left→right gradient in the palette (green by default) with a highlight moving one cell per frame,
 // period `filled + 6`.
-export function shimmer(filled: number, frame: number): string[] {
+export function shimmer(filled: number, frame: number, palette: Palette = GREEN): string[] {
   if (filled <= 0) return []
   const period = filled + 6
   const pos = (((frame % period) + period) % period) - 3
   return Array.from({ length: filled }, (_, i) => {
-    const base = mix(DARK, LIGHT, filled === 1 ? 0 : i / (filled - 1))
+    const base = mix(palette.dark, palette.light, filled === 1 ? 0 : i / (filled - 1))
     const glow = Math.max(0, 1 - Math.abs(i - pos) / RADIUS)
-    return hex(mix(base, GLOW, glow * 0.85))
+    return hex(mix(base, palette.glow, glow * 0.85))
   })
 }
 
