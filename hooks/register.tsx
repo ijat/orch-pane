@@ -3,7 +3,7 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
 import {
-  ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
+  agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, stateColor, stepsTail, stripMarks, textKey,
 } from './lib'
@@ -22,7 +22,7 @@ const showAll = atom({ plugin: 'orch-pane', key: 'showAll' } as const, false)
 const expanded = atom({ plugin: 'orch-pane', key: 'expanded' } as const, {} as Record<string, boolean>)
 const dismissed = atom({ plugin: 'orch-pane', key: 'dismissed' } as const, false)
 // Animation frame: ticks only while the pane is drawn and a shown task has a role running. It drives the
-// spinner (frame % 10) and the running Steps bar's shimmer.
+// spinner (frame % 10) and the running agents' bar shimmer.
 const frame = atom({ plugin: 'orch-pane', key: 'frame' } as const, 0)
 
 // Haiku's plain-language summaries by cache key (also kept in $.store), and the Ask box's question.
@@ -428,9 +428,7 @@ export const register: Register = on => {
       const cells =
         b.kind === 'overall'
           ? [<Text color="claude">{'█'.repeat(filled)}</Text>]
-          : isRunning(t)
-            ? colourRuns(shimmer(filled, tick)).map(r => <Text color={r.color}>{'█'.repeat(r.n)}</Text>)
-            : [<Text color="success">{'█'.repeat(filled)}</Text>]
+          : [<Text color="success">{'█'.repeat(filled)}</Text>]
       return (
         <Text>
           <Text bold>{b.label.padEnd(layout.labelW)}</Text>
@@ -515,7 +513,7 @@ export const register: Register = on => {
       })
     }
 
-    const runningRows = (t: StatusTask) => {
+    const runningRows = (t: StatusTask, barW: number) => {
       const spawn = t.running.last_spawn
       const rows = t.running.roles.map(r => {
         const mine = spawn && spawn.role === r.role ? spawn : null
@@ -523,6 +521,8 @@ export const register: Register = on => {
         // The spawn's own step list is current; a status file's `step` may be an older one.
         const last = r.step && !mine?.steps?.length ? `last: ${r.step}` : null
         const tail = [since ? `running ${since}` : null, last].filter(Boolean)
+        const pct = agentPct(r)
+        const pctFilled = pct === null ? 0 : barCells(pct, barW)
         return (
           <Box flexDirection="column">
             <Text>
@@ -531,6 +531,16 @@ export const register: Register = on => {
               {mine?.tier ? <Text color="permission">{`  ${mine.tier}`}</Text> : null}
               {mine?.steps?.length ? <Text color="suggestion">{`  steps ${mine.steps.join(',')}`}</Text> : null}
             </Text>
+            {pct !== null && (
+              <Text>
+                {'    '}
+                {pctFilled > 0
+                  ? colourRuns(shimmer(pctFilled, tick, agentPalette(r.role))).map(c => <Text color={c.color}>{'█'.repeat(c.n)}</Text>)
+                  : null}
+                <Text dimColor>{'░'.repeat(barW - pctFilled)}</Text>
+                <Text dimColor>{`  ${agentPctTail(pct)}`}</Text>
+              </Text>
+            )}
             {tail.length > 0 && <Text dimColor>{`  ${tail.join(' · ')}`}</Text>}
           </Box>
         )
@@ -548,13 +558,13 @@ export const register: Register = on => {
       return rows
     }
 
-    const nowRows = (t: StatusTask) => {
+    const nowRows = (t: StatusTask, barW: number) => {
       const act = lastActivity(t)
       const when = act ? ago(act.at, now) : null
       const actText = act ? [act.who, act.text].filter(Boolean).join(' ') + (when ? ` · ${when}` : '') : null
       const idle = now !== null && isStale(t, now) ? idleMinutes(t, now) : null
       return [
-        ...runningRows(t),
+        ...runningRows(t, barW),
         actText ? <Text dimColor>{clip(actText, room)}</Text> : null,
         idle !== null && now !== null ? <Text color="warning">{`idle ${minutesText(idle, now)} · nothing running`}</Text> : null,
         t.error ? <Text color="error">{t.error}</Text> : null,
@@ -646,7 +656,7 @@ export const register: Register = on => {
               {facts ? <Text color="subtle">{facts}</Text> : null}
               {section('Goal', goalRows(t))}
               {section('Index', indexRows(t))}
-              {section('Now', nowRows(t))}
+              {section('Now', nowRows(t, layout.barW))}
               {section('Progress', progress.map(b => barRow(t, b, layout)))}
               {milestones.length > 0
                 ? section('Milestones', foldedList(t, 'ms', milestones, m => m.state, m => `M${m.n}`, m => milestoneRow(t, m)), msDone)
