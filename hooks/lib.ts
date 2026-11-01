@@ -507,6 +507,9 @@ const PALETTES: Record<string, Palette> = {
   director: { dark: [0xc0, 0x26, 0xd3], light: [0xe8, 0x79, 0xf9], glow: [0xfd, 0xf0, 0xff] }, // #c026d3 #e879f9 #fdf0ff
 }
 
+// Idle (0%) bar: the whole bar shimmers in dark grey.
+export const GREY: Palette = { dark: [0x3a, 0x3a, 0x3a], light: [0x55, 0x55, 0x55], glow: [0x8a, 0x8a, 0x8a] }
+
 export function agentPalette(role: string | null): Palette {
   const base = (role ?? '').split(':')[0] ?? ''
   return Object.hasOwn(PALETTES, base) ? PALETTES[base]! : GREEN

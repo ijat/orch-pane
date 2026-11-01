@@ -3,7 +3,7 @@ import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
 import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
 import {
-  agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
+  GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, stateColor, stepsTail, stripMarks, textKey,
 } from './lib'
@@ -558,7 +558,8 @@ export const register: Register = on => {
         const last = r.step && !mine?.steps?.length ? `last: ${r.step}` : null
         const tail = [since ? `running ${since}` : null, last].filter(Boolean)
         const pct = agentPct(r)
-        const pctFilled = pct === null ? 0 : barCells(pct, barW)
+        const pctFilled = pct === null ? 0 : pct === 0 ? barW : barCells(pct, barW)
+        const pctPalette = pct === 0 ? GREY : agentPalette(r.role)
         return (
           <Box flexDirection="column">
             <Text>
@@ -569,9 +570,9 @@ export const register: Register = on => {
             </Text>
             {pct !== null && (
               <Text>
-                {'    '}
+                {'  '}
                 {pctFilled > 0
-                  ? colourRuns(shimmer(pctFilled, tick, agentPalette(r.role))).map(c => <Text color={c.color}>{'█'.repeat(c.n)}</Text>)
+                  ? colourRuns(shimmer(pctFilled, tick, pctPalette)).map(c => <Text color={c.color}>{'█'.repeat(c.n)}</Text>)
                   : null}
                 <Text dimColor>{'░'.repeat(barW - pctFilled)}</Text>
                 <Text dimColor>{`  ${agentPctTail(pct)}`}</Text>
