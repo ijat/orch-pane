@@ -631,7 +631,6 @@ export const register: Register = on => {
           <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
             <Text color={color}>{isOpenTask ? '▾' : '▸'}</Text>{' '}
             <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
-            {t.worktree ? <Text color="suggestion">{' [WT]'}</Text> : null}
             {'  '}
             <Text color={color}>{t.state_words ?? t.state}</Text>
             {questions > 0 ? <Text color="warning">{`  ? ${plural(questions, 'question')}`}</Text> : null}
@@ -639,7 +638,11 @@ export const register: Register = on => {
           </Button>
           {isOpenTask && (
             <Box flexDirection="column" paddingLeft={2}>
-              {placeText(t) ? <Text color="suggestion">{clip(placeText(t), width - 4)}</Text> : null}
+              {placeText(t) ? (
+                <Box marginTop={1}>
+                  <Text color="suggestion">{clip(placeText(t), width - 4)}</Text>
+                </Box>
+              ) : null}
               {facts ? <Text color="subtle">{facts}</Text> : null}
               {section('Goal', goalRows(t))}
               {section('Index', indexRows(t))}
