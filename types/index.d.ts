@@ -46,7 +46,7 @@ export type StatusTask = {
   updated: string | null
   last_log: string | null
   questions_open: number | null
-  running: { roles: StatusRole[]; last_spawn: StatusSpawn | null }
+  running: { roles: StatusRole[]; last_spawn: StatusSpawn | null; spawns?: StatusSpawn[] }
   steps: {
     total: number | null
     done: number | null

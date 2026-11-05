@@ -5,7 +5,7 @@ import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, Sta
 import {
   GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
-  scopeLabel, shimmer, sortByAttention, stateColor, stepsTail, stripMarks, textKey,
+  scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -552,7 +552,7 @@ export const register: Register = on => {
     const runningRows = (t: StatusTask, barW: number) => {
       const spawn = t.running.last_spawn
       const rows = t.running.roles.map(r => {
-        const mine = spawn && spawn.role === r.role ? spawn : null
+        const mine = spawnOf(t, r.role)
         const since = mine && !mine.returned ? elapsed(mine.ts, now) : null
         // The spawn's own step list is current; a status file's `step` may be an older one.
         const last = r.step && !mine?.steps?.length ? `last: ${r.step}` : null
