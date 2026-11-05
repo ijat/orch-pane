@@ -13,6 +13,12 @@ const clamp = (n: number, lo: number, hi: number) => Math.max(lo, Math.min(hi, n
 export const isRunning = (t: StatusTask) =>
   t.running.roles.length > 0 || (t.running.last_spawn !== null && !t.running.last_spawn.returned)
 
+// The role's own spawn. `spawns` has one per running role; an orch older than that only has `last_spawn`.
+export const spawnOf = (t: StatusTask, role: string | null) => {
+  const { spawns, last_spawn: last } = t.running
+  return spawns?.find(s => s.role === role) ?? (last && last.role === role ? last : null)
+}
+
 // Theme keys, so the colors follow the person's theme.
 export function stateColor(state: string) {
   if (/done|merged|complete/.test(state)) return 'success'
