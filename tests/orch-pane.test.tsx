@@ -5,7 +5,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 import {
   agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
-  sortByAttention, sparkline, stepsTail, textKey,
+  sortByAttention, spawnOf, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
 import type { IndexStatus, StatusRole, StatusTask } from '../types'
@@ -430,6 +430,19 @@ test('stale means an active task with nothing running for over 30 minutes', () =
   expect(idleMinutes(task({ updated: null }), T0)).toBeNull()
 })
 
+test('each running role finds its own spawn, not just the newest', () => {
+  const spawn = (role: string, tier: string) =>
+    ({ ts: '2026-10-29T10:18Z', role, agent: 'orch-implementer', tier, steps: ['1'], milestone: 2, returned: false })
+  const [a, b] = [spawn('implementer:a', 'opus/medium'), spawn('implementer:b', 'sonnet/high')]
+  const both = task({ running: { roles: [], last_spawn: b, spawns: [a, b] } })
+  expect(spawnOf(both, 'implementer:a')?.tier).toBe('opus/medium')
+  expect(spawnOf(both, 'implementer:b')?.tier).toBe('sonnet/high')
+  expect(spawnOf(both, 'implementer:c')).toBeNull()
+  const old = task({ running: { roles: [], last_spawn: b } })   // an orch without `spawns`
+  expect(spawnOf(old, 'implementer:b')?.tier).toBe('sonnet/high')
+  expect(spawnOf(old, 'implementer:a')).toBeNull()
+})
+
 test('tasks needing attention sort first, the rest keep their order', () => {
   const a = task({ id: 'a', state: 'awaiting_approval' })
   const b = task({ id: 'b', state: 'awaiting_approval' })
@@ -639,7 +652,7 @@ const withRoles = (...roles: { role: string; pct?: unknown }[]) => ({
   },
 })
 const barLines = async (ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ text: string }[]> }) =>
-  (await ui.findAll({ type: 'Text', text: /^ {4}[█░]+ {2} *\d+%$/ })).map(t => t.text)
+  (await ui.findAll({ type: 'Text', text: /^ {2}[█░]+ {2} *\d+%$/ })).map(t => t.text)
 
 test('a running agent that reports pct gets a bar under its name, as wide as the Steps bar', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
