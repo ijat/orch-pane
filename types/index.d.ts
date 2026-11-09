@@ -197,6 +197,7 @@ declare module 'claude-code' {
       tab: Tab | null
       ai: boolean
       notify: boolean
+      compactSend: boolean
       auto: boolean
       drafts: Shaped<{ loaded: boolean; byTask: Drafts }>
       qstate: QState
