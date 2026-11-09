@@ -444,26 +444,29 @@ async function reconcile($: EngineInterface) {
   const current = { ...q.current }
   const order = { ...q.order }
   const pins: [string, string][] = []
+  const seen = q.current
   let dropped: Drafts = ds
   for (const t of data.tasks) {
     if (!t.questions) continue
     const v = viewOf(t, q, ds)
-    order[t.id] = v.order
-    current[t.id] = v.current?.id ?? null
-    // The group being answered stays the one the person is in while it has open questions; a new question in
-    // another group, even one that sorts first, does not move them.
-    if (v.label !== null && q.group[t.id] == null) pins.push([t.id, v.label])
-    // Only a loaded group says which of its questions are still open.
+    // Only a loaded group says which of its questions are still open: until then the open question stays as it was.
     const loaded = v.label === t.questions.open_group || q.fetched[groupKey(t.id, v.label ?? '')] !== undefined
+    // The stored group always follows the group in view, so a group that emptied and later refills, or a new
+    // question in another group, does not move the open question on a poll.
+    if (v.label !== null && v.label !== q.group[t.id]) pins.push([t.id, v.label])
     if (loaded) {
+      order[t.id] = v.order
+      current[t.id] = v.current?.id ?? null
       const stale = Object.entries(ds[t.id] ?? {}).filter(([id, d]) => d.group !== null && d.group === v.label && !v.byId.has(id)).map(([id]) => id)
       if (stale.length > 0) dropped = withoutDrafts(dropped, t.id, stale)
     }
   }
   if (dropped !== ds) await writeDrafts($, () => dropped)
   await patchQ($, s => ({
-    ...s, current, order,
-    group: { ...s.group, ...Object.fromEntries(pins.filter(([id]) => s.group[id] == null)) },
+    ...s, order,
+    // A press during this poll wins over what the poll worked out from the state before it.
+    current: Object.fromEntries(Object.entries(current).map(([id, c]) => [id, (s.current[id] ?? null) === (seen[id] ?? null) ? c : s.current[id] ?? null])),
+    group: { ...s.group, ...Object.fromEntries(pins.filter(([id]) => (s.group[id] ?? null) === (q.group[id] ?? null))) },
   }))
 }
 
@@ -816,6 +819,14 @@ async function sendTask($: EngineInterface, t: StatusTask, last?: StatusQuestion
     return
   }
   await writeDrafts($, all => withoutDrafts(all, t.id, pairs.map(p => p[0])))
+  // Another folder's task belongs to another session: its answers are on disk, and this session is neither
+  // compacted nor woken for them.
+  if (t.in_cwd !== true) {
+    await setQ($, t.id, { sending: false, error: null })
+    await fetchStatus($)
+    $.ui.toast(`${plural(pairs.length, 'answer')} saved; that task's session reads them at its next checkpoint`)
+    return
+  }
   // Compact, then send: with the option on, the conversation is compacted after the answers are on disk and
   // before the wake. A refusal (something runs) skips the compaction and still wakes.
   if ((await read($, compactSend)) === true) {
@@ -837,6 +848,9 @@ const marker = (state: ItemState) => (state === 'done' ? '✓' : state === 'curr
 const stepState = (s: StatusStep): ItemState => (s.done ? 'done' : s.current ? 'current' : 'pending')
 
 const percentText = (t: StatusTask) => (t.overall.percent === null ? '' : `${t.overall.percent}%`)
+
+// What a Send does next: only a task of this folder has its agent woken here.
+const afterSend = (t: StatusTask) => (t.in_cwd !== true ? 'saved for that task\'s session' : isRunning(t) ? 'agent keeps working' : 'wakes the agent')
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
@@ -1328,7 +1342,7 @@ export const register: Register = on => {
                   ? <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t, q)}>{`Send ${plural(count, 'answer')}`}</Button>
                   : <Button key={`next:${t.id}`} variant="primary" onPress={() => confirmQuestion($, t, q, true)}>Next</Button>}
               {others !== null ? <Button key={`skip:${t.id}`} onPress={() => skipQuestion($, t, q)}>Skip for now</Button> : null}
-              {ready && others === null ? <Text dimColor>{isRunning(t) ? 'agent keeps working' : 'wakes the agent'}</Text> : null}
+              {ready && others === null ? <Text dimColor>{afterSend(t)}</Text> : null}
             </Box>
           </Box>
         )
@@ -1400,7 +1414,7 @@ export const register: Register = on => {
         v.current === null && confirmedAll > 0
           ? <Box marginTop={1} flexDirection="row" columnGap={2}>
               <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t)}>{`Send ${plural(confirmedAll, 'answer')}`}</Button>
-              <Text dimColor>{stay > 0 ? `${stay} stay open` : isRunning(t) ? 'agent keeps working' : 'wakes the agent'}</Text>
+              <Text dimColor>{stay > 0 ? `${stay} stay open` : afterSend(t)}</Text>
             </Box>
           : null,
         canAccept > 0 ? <Box marginTop={1}><Button key={`accept:${t.id}`} plain onPress={() => acceptGroup($, t)}><Text dimColor>{acceptText}</Text></Button></Box> : null,
