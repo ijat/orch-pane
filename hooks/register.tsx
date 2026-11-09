@@ -1,11 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
+import type { About, AboutPart, AskState, Draft, Drafts, IndexStatus, PlainEntry, QState, Snapshot, StatusJson, StatusMilestone, StatusQuestion, StatusStep, StatusTask, Tab } from '../types'
 import {
-  GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
+  GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, countTail, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
+  HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
+  historyRows, isCritical, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
+  recommendedOf, skipFor, staleQuestion, UNGROUPED, HOLD_LABEL, HOLD_NOTE,
+  COMPACT_SEND_NOTE, COMPACT_TOOL, COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -29,7 +33,28 @@ const frame = atom({ plugin: 'orch-pane', key: 'frame' } as const, 0)
 const plain = atom({ plugin: 'orch-pane', key: 'plain' } as const, {} as Record<string, PlainEntry>)
 const IDLE: AskState = { state: 'idle' }
 const ask = atom({ plugin: 'orch-pane', key: 'ask' } as const, IDLE)
+// The folded bottom panel's open tab (null: all folded), and the Advanced option "AI summaries" (also kept in $.store).
+const tab = atom({ plugin: 'orch-pane', key: 'tab' } as const, null as Tab | null)
+const ai = atom({ plugin: 'orch-pane', key: 'ai' } as const, true)
+const AI_KEY = 'opt:ai'
+// Notify (also kept in $.store) and Auto-answer (this session only: it answers for the person, so it starts off).
+const notify = atom({ plugin: 'orch-pane', key: 'notify' } as const, false)
+const NOTIFY_KEY = 'opt:notify'
+// Compact, then send (also kept in $.store): a Send compacts the conversation before it wakes the agent.
+const compactSend = atom({ plugin: 'orch-pane', key: 'compactSend' } as const, false)
+const COMPACT_SEND_KEY = 'opt:compact-send'
+const auto = atom({ plugin: 'orch-pane', key: 'auto' } as const, false)
+// Unsent answers (D5): the atom serves the drawing, $.store keeps them; a pane whose atom was lost reloads them.
+const EMPTY_DRAFTS: { loaded: boolean; byTask: Drafts } = { loaded: false, byTask: {} }
+const drafts = atom({ plugin: 'orch-pane', key: 'drafts' } as const, EMPTY_DRAFTS, { shape: 'drafts-1' })
+const DRAFTS_KEY = 'drafts'
+const EMPTY_Q: QState = { current: {}, group: {}, order: {}, fetched: {}, full: {}, sending: {}, error: {} }
+const qstate = atom({ plugin: 'orch-pane', key: 'qstate' } as const, EMPTY_Q)
+const hist = atom({ plugin: 'orch-pane', key: 'hist' } as const, { query: '', page: 0 })
 
+const AGENTS_SHOWN = 3
+const ROWS_SHOWN = 8
+const FULL_KEPT = 400
 const SPIN_MS = 120
 const FRAME_WRAP = 3600
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -119,7 +144,7 @@ async function fetchAbout($: EngineInterface, home: string, windows: boolean): P
 }
 
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
-async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
+async function fetchStatusOnce($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
   inFlight = true
   try {
@@ -168,6 +193,367 @@ async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
   } finally {
     inFlight = false
   }
+}
+
+// -- answering -------------------------------------------------------------------------------------
+// The questions of `orch status --json` are answered through `orch answers`, never by writing the file. Unsent
+// picks are drafts (D5). One wake, a fixed text, follows each batch that landed on disk.
+
+const asQ = (raw: QState | undefined): QState => ({ ...EMPTY_Q, ...(raw && typeof raw === 'object' ? raw : {}) })
+const readQ = async ($: EngineInterface) => asQ(await read($, qstate))
+const patchQ = ($: EngineInterface, f: (q: QState) => QState) => update($, qstate, s => f(asQ(s)))
+const setQ = ($: EngineInterface, taskId: string, patch: { current?: string | null; group?: string | null; error?: string | null; sending?: boolean }) =>
+  patchQ($, q => ({
+    ...q,
+    current: 'current' in patch ? { ...q.current, [taskId]: patch.current ?? null } : q.current,
+    group: 'group' in patch ? { ...q.group, [taskId]: patch.group ?? null } : q.group,
+    error: 'error' in patch ? { ...q.error, [taskId]: patch.error ?? null } : q.error,
+    sending: 'sending' in patch ? { ...q.sending, [taskId]: patch.sending === true } : q.sending,
+  }))
+
+async function loadDrafts($: EngineInterface) {
+  const cur = await read($, drafts)
+  if (cur?.loaded === true && cur.byTask && typeof cur.byTask === 'object') return
+  let byTask: Drafts = {}
+  try {
+    const stored = await $.store.get(DRAFTS_KEY)
+    if (stored && typeof stored === 'object') byTask = stored as Drafts
+  } catch {
+    // No drafts to restore.
+  }
+  await update($, drafts, () => ({ loaded: true, byTask }))
+}
+
+const draftsOf = async ($: EngineInterface): Promise<Drafts> => {
+  await loadDrafts($)
+  return (await read($, drafts)).byTask
+}
+
+async function writeDrafts($: EngineInterface, f: (all: Drafts) => Drafts) {
+  const next = f(await draftsOf($))
+  await update($, drafts, () => ({ loaded: true, byTask: next }))
+  try {
+    await $.store.set(DRAFTS_KEY, next)
+  } catch {
+    // This session keeps them; a restart loses the unsent picks.
+  }
+}
+
+const withDraft = (all: Drafts, taskId: string, qid: string, patch: Partial<Draft>): Drafts =>
+  ({ ...all, [taskId]: { ...(all[taskId] ?? {}), [qid]: { ...NO_DRAFT, ...(all[taskId]?.[qid] ?? {}), ...patch } } })
+
+const withoutDrafts = (all: Drafts, taskId: string, ids: readonly string[]): Drafts => {
+  const mine = Object.fromEntries(Object.entries(all[taskId] ?? {}).filter(([id]) => !ids.includes(id)))
+  const { [taskId]: _gone, ...rest } = all
+  return Object.keys(mine).length > 0 ? { ...rest, [taskId]: mine } : rest
+}
+
+type Where = { windows: boolean; home: string; orch: string; cwd: string }
+
+async function whereIsOrch($: EngineInterface): Promise<Where | null> {
+  const windows = (await $.env.get('OS')) === 'Windows_NT'
+  const home = windows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
+  if (!home) return null
+  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd() }
+}
+
+// `orch status --json --question-group <label>` (from the `skip`-th question on in full): the data, or null.
+async function runGroup($: EngineInterface, label: string, skip: number): Promise<StatusJson | null> {
+  const where = await whereIsOrch($)
+  if (!where) return null
+  let ran
+  try {
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, '--question-group', label,
+      ...(skip > 0 ? ['--question-skip', String(skip)] : [])], { timeoutMs: RUN_TIMEOUT_MS })
+  } catch {
+    return null
+  }
+  if (ran.exitCode !== 0) return null
+  try {
+    const data = JSON.parse(ran.stdout) as StatusJson
+    return data && data.schema === 1 && Array.isArray(data.tasks) ? data : null
+  } catch {
+    return null
+  }
+}
+
+// Another group's open questions, kept by task and group.
+async function loadGroup($: EngineInterface, label: string) {
+  const data = await runGroup($, label, 0)
+  if (!data) return
+  const got = Object.fromEntries(data.tasks.map(t => [groupKey(t.id, label), t.questions?.open ?? []]))
+  await patchQ($, q => ({ ...q, fetched: { ...q.fetched, ...got } }))
+}
+
+const fullBusy = new Set<string>()
+
+// A long list draws its tail without options. When the open question or the next one lacks them, asks orch for the
+// window that starts there and keeps the full entries (`--question-skip`).
+async function ensureFull($: EngineInterface, taskId: string) {
+  if (fullBusy.has(taskId)) return
+  const t = (await read($, snapshot))?.data?.tasks.find(x => x.id === taskId)
+  if (!t?.questions) return
+  const q = await readQ($)
+  const v = viewOf(t, q, await draftsOf($))
+  const skip = skipFor(v.list, v.order, v.mine, v.current?.id ?? null)
+  if (skip === null || v.label === null) return
+  fullBusy.add(taskId)
+  try {
+    const data = await runGroup($, v.label, skip)
+    if (!data) return
+    const got: Record<string, StatusQuestion> = {}
+    for (const x of data.tasks) for (const e of x.questions?.open ?? []) if (hasOptions(e)) got[groupKey(x.id, e.id)] = e
+    await patchQ($, s => ({ ...s, full: { ...(Object.keys(s.full).length > FULL_KEPT ? {} : s.full), ...got } }))
+  } finally {
+    fullBusy.delete(taskId)
+  }
+}
+
+type Sent = { ok: true } | { ok: false; error: string; stale: string | null }
+
+// `orch answers` for one task. The answers are argv elements: no shell, no quoting.
+async function runAnswers($: EngineInterface, taskId: string, pairs: readonly [string, string][], isAuto: boolean): Promise<Sent> {
+  const where = await whereIsOrch($)
+  if (!where) return { ok: false, error: 'orch answers could not run: HOME is not set', stale: null }
+  let ran
+  try {
+    ran = await $.process.run(answersArgv(where.windows, where.orch, taskId, pairs, isAuto), { timeoutMs: RUN_TIMEOUT_MS })
+  } catch (err) {
+    return { ok: false, error: `orch answers could not run: ${errorText(err)}`, stale: null }
+  }
+  if (ran.exitCode !== 0) {
+    return { ok: false, error: `orch answers failed: ${firstLine(ran.stderr) || `exit ${ran.exitCode}`}`, stale: staleQuestion(ran.stderr) }
+  }
+  return { ok: true }
+}
+
+// One wake per batch, after the answers are on disk. The text is fixed: no answer goes through it.
+async function wake($: EngineInterface): Promise<string | null> {
+  try {
+    await $.prompt.submit({ text: WAKE_TEXT })
+    return null
+  } catch (err) {
+    return errorText(err)
+  }
+}
+
+// -- compaction ------------------------------------------------------------------------------------
+// The model asks through the `compact_when_idle` tool; the request waits for the turn to end, then runs once. The
+// same compaction serves the `Compact, then send` option. Both refuse while anything runs, read from `orch status`.
+
+const COMPACT_TRIES = 5
+const COMPACT_RETRY_MS = 1000
+
+// A request in the making: null, or what the model asked the summary to keep. Cleared when it runs or is refused.
+let compactAsked: { instructions: string | null } | null = null
+let compactRunning = false
+
+// Why a compaction must wait, from a fresh `orch status --json`: null when nothing runs, else the reason. A status
+// that cannot be read is a reason too: an unknown state is not an idle one.
+async function whyNotNow($: EngineInterface): Promise<string | null> {
+  const where = await whereIsOrch($)
+  if (!where) return 'orch could not be found (HOME is not set)'
+  let ran
+  try {
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd], { timeoutMs: RUN_TIMEOUT_MS })
+  } catch (err) {
+    return `orch status could not run: ${errorText(err)}`
+  }
+  if (ran.exitCode !== 0) return `orch status failed: ${firstLine(ran.stderr) || `exit ${ran.exitCode}`}`
+  try {
+    const data = JSON.parse(ran.stdout) as StatusJson
+    if (!data || data.schema !== 1 || !Array.isArray(data.tasks)) return 'orch status printed an unsupported answer'
+    return busyReason(data.tasks)
+  } catch {
+    return 'orch status printed something that is not JSON'
+  }
+}
+
+// One compaction between turns: null when it ran, else why not. `$.session.compact` rejects while a turn runs, and
+// the turn that asked has only just completed, so it is tried a few times a second apart, each time after a fresh
+// check that nothing runs.
+async function compactNow($: EngineInterface, instructions: string | null): Promise<string | null> {
+  if (compactRunning) return 'a compaction is already running'
+  compactRunning = true
+  try {
+    let last = 'the session did not become idle'
+    for (let i = 0; i < COMPACT_TRIES; i++) {
+      // Every attempt re-reads what runs: the turn that kept the first one out may have spawned an agent and ended.
+      const why = await whyNotNow($)
+      if (why) return why
+      try {
+        const r = await $.session.compact(instructions ? { instructions } : {})
+        return r.skip === undefined ? null : `the compaction was vetoed: ${r.skip}`
+      } catch (err) {
+        last = errorText(err)
+        if (i < COMPACT_TRIES - 1) await $.clock.sleep(COMPACT_RETRY_MS)
+      }
+    }
+    return last
+  } finally {
+    compactRunning = false
+  }
+}
+
+// At the end of a main-loop turn: runs the request the model made, once. The request is cleared first, so a
+// compaction that fails or is refused is not retried until the model asks again.
+async function runRequestedCompact($: EngineInterface) {
+  const asked = compactAsked
+  compactAsked = null
+  if (!asked) return
+  const why = await compactNow($, asked.instructions)
+  if (why) {
+    $.ui.toast(`Compaction skipped: ${why}`)
+    return
+  }
+  await $.prompt.submit({ text: COMPACT_WAKE_TEXT }).catch(() => undefined)
+}
+
+// The model-callable tool: records a request, or refuses with a reason while a subagent runs.
+async function requestCompact($: EngineInterface, instructions: string | null): Promise<{ deny: string } | { result: string }> {
+  const why = await whyNotNow($)
+  if (why) return { deny: `Not compacting now: ${why}. Ask again at a checkpoint when nothing is running.` }
+  const again = compactAsked !== null
+  compactAsked = { instructions: instructions ?? compactAsked?.instructions ?? null }
+  return {
+    result: again
+      ? 'A compaction is already requested; it runs once, when this turn ends.'
+      : 'Compaction requested. It runs once, when this turn ends, and you are woken afterwards: re-read the task state with `orch` then.',
+  }
+}
+
+// The task's questions as drawn: its open group's, the order they joined the queue, and the question that is open.
+function viewOf(t: StatusTask, q: QState, ds: Drafts) {
+  const qq = t.questions
+  const label = activeGroupOf(t, q.group[t.id] ?? null)
+  const list = openListOf(t, q.group[t.id] ?? null, q.fetched, q.full)
+  const byId = new Map(list.map(x => [x.id, x]))
+  const seen = (q.order[t.id] ?? []).filter(id => byId.has(id))
+  const order = mergeOrder(seen, list.map(x => x.id))
+  const mine = ds[t.id] ?? {}
+  const current = pickCurrent(order, mine, q.current[t.id] ?? null)
+  return { qq, label, list, byId, order, mine, current: current === null ? null : byId.get(current) ?? null }
+}
+
+// Keeps each task's open question and queue order across polls, and drops drafts of questions that are no longer open.
+async function reconcile($: EngineInterface) {
+  const data = (await read($, snapshot))?.data
+  if (!data) return
+  const ds = await draftsOf($)
+  const q = await readQ($)
+  const current = { ...q.current }
+  const order = { ...q.order }
+  const pins: [string, string][] = []
+  const seen = q.current
+  let dropped: Drafts = ds
+  for (const t of data.tasks) {
+    if (!t.questions) continue
+    const v = viewOf(t, q, ds)
+    // Only a loaded group says which of its questions are still open: until then the open question stays as it was.
+    const loaded = v.label === t.questions.open_group || q.fetched[groupKey(t.id, v.label ?? '')] !== undefined
+    // The stored group always follows the group in view, so a group that emptied and later refills, or a new
+    // question in another group, does not move the open question on a poll.
+    if (v.label !== null && v.label !== q.group[t.id]) pins.push([t.id, v.label])
+    if (loaded) {
+      order[t.id] = v.order
+      current[t.id] = v.current?.id ?? null
+      const stale = Object.entries(ds[t.id] ?? {}).filter(([id, d]) => d.group !== null && d.group === v.label && !v.byId.has(id)).map(([id]) => id)
+      if (stale.length > 0) dropped = withoutDrafts(dropped, t.id, stale)
+    }
+  }
+  if (dropped !== ds) await writeDrafts($, () => dropped)
+  await patchQ($, s => ({
+    ...s, order,
+    // A press during this poll wins over what the poll worked out from the state before it.
+    current: Object.fromEntries(Object.entries(current).map(([id, c]) => [id, (s.current[id] ?? null) === (seen[id] ?? null) ? c : s.current[id] ?? null])),
+    group: { ...s.group, ...Object.fromEntries(pins.filter(([id]) => (s.group[id] ?? null) === (q.group[id] ?? null))) },
+  }))
+}
+
+// Question counts seen last, to tell a new arrival from the first look; and pairs an auto-answer already failed on.
+const lastOpen = new Map<string, number>()
+const autoFailed = new Map<string, string>()
+// Questions an auto-answer already took this session: a poll that still lists one (a slow status) never takes it twice.
+const autoDone = new Map<string, Set<string>>()
+let autoBusy = false
+
+async function notifyNew($: EngineInterface, data: StatusJson) {
+  const on_ = (await read($, notify)) === true
+  for (const t of data.tasks) {
+    const open = t.questions?.counts.open ?? 0
+    const before = lastOpen.get(t.id)
+    lastOpen.set(t.id, open)
+    if (on_ && before !== undefined && open > before) {
+      const n = open - before
+      try {
+        await $.ui.notify(`${t.slug ?? t.id}: ${plural(n, 'new question')} waiting for you`)
+      } catch {
+        // A refused notification is not worth more than the pane's own count.
+      }
+    }
+  }
+}
+
+// Answers the reversible, recommended questions nobody has touched, through `orch answers --auto`, then wakes once.
+async function autoPass($: EngineInterface) {
+  if (autoBusy || (await read($, auto)) !== true) return
+  autoBusy = true
+  try {
+    const data = (await read($, snapshot))?.data
+    if (!data) return
+    const ds = await draftsOf($)
+    const q = await readQ($)
+    let landed = false
+    for (const t of data.tasks) {
+      // Only this folder's tasks: another repo's decisions are not taken here, and this session is not woken for them.
+      if (!t.questions || t.in_cwd !== true) continue
+      const pairs = autoPairs(viewOf(t, q, ds).list, ds[t.id]).filter(([id]) => !autoDone.get(t.id)?.has(id))
+      const sig = pairs.map(p => p.join('=')).join('|')
+      if (pairs.length === 0 || autoFailed.get(t.id) === sig) continue
+      const r = await runAnswers($, t.id, pairs, true)
+      if (r.ok) {
+        autoFailed.delete(t.id)
+        autoDone.set(t.id, new Set([...(autoDone.get(t.id) ?? []), ...pairs.map(([id]) => id)]))
+        landed = true
+      } else {
+        autoFailed.set(t.id, sig)
+        await setQ($, t.id, { error: r.error })
+      }
+    }
+    if (landed) {
+      await wake($)
+      autoBusy = false
+      await fetchStatus($)
+    }
+  } finally {
+    autoBusy = false
+  }
+}
+
+async function afterFetch($: EngineInterface, data: StatusJson) {
+  try {
+    await loadDrafts($)
+    const q = await readQ($)
+    const wanted = new Set<string>()
+    for (const t of data.tasks) {
+      const sel = q.group[t.id] ?? null
+      const label = t.questions ? activeGroupOf(t, sel) : null
+      if (t.questions && label !== null && label !== t.questions.open_group) wanted.add(label)
+    }
+    for (const label of wanted) await loadGroup($, label)
+    await reconcile($)
+    for (const t of data.tasks) await ensureFull($, t.id)
+    await notifyNew($, data)
+    await autoPass($)
+  } catch {
+    // Questions are an extra on the poll: a failure here never costs the status.
+  }
+}
+
+async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
+  const data = await fetchStatusOnce($)
+  if (data) await afterFetch($, data)
+  return data
 }
 
 async function isOpen($: EngineInterface) {
@@ -283,10 +669,174 @@ async function askHaiku($: EngineInterface, question: string, tasks: readonly St
   await update($, ask, () => settled)
 }
 
+// The AI-summaries option outlives the session: the store holds it, the atom serves the drawing.
+async function loadAi($: EngineInterface) {
+  try {
+    const stored = await $.store.get(AI_KEY)
+    if (typeof stored === 'boolean') await update($, ai, () => stored)
+    const notified = await $.store.get(NOTIFY_KEY)
+    if (typeof notified === 'boolean') await update($, notify, () => notified)
+    const compacting = await $.store.get(COMPACT_SEND_KEY)
+    if (typeof compacting === 'boolean') await update($, compactSend, () => compacting)
+  } catch {
+    // The defaults stay: AI summaries on, notifications off.
+  }
+}
+
+async function toggleNotify($: EngineInterface) {
+  const next = (await read($, notify)) !== true
+  await update($, notify, () => next)
+  try {
+    await $.store.set(NOTIFY_KEY, next)
+  } catch {
+    // This session keeps it.
+  }
+}
+
+async function toggleCompactSend($: EngineInterface) {
+  const next = (await read($, compactSend)) !== true
+  await update($, compactSend, () => next)
+  try {
+    await $.store.set(COMPACT_SEND_KEY, next)
+  } catch {
+    // This session keeps it.
+  }
+}
+
+async function toggleAuto($: EngineInterface) {
+  const next = (await read($, auto)) !== true
+  await update($, auto, () => next)
+  autoFailed.clear()
+  if (next) await autoPass($)
+}
+
+async function toggleAi($: EngineInterface) {
+  const next = (await read($, ai)) === false
+  await update($, ai, () => next)
+  try {
+    await $.store.set(AI_KEY, next)
+  } catch {
+    // This session keeps it; the next one starts from the default.
+  }
+}
+
 async function clearAsk($: EngineInterface) {
   askStop?.abort()
   askStop = null
   await update($, ask, () => IDLE)
+}
+
+// What the person's presses do. Each reads the state afresh: a press never trusts what the last draw showed.
+
+const draftOf = (all: Drafts, taskId: string, qid: string): Draft | undefined => all[taskId]?.[qid]
+
+async function viewNow($: EngineInterface, t: StatusTask) {
+  return viewOf(t, await readQ($), await draftsOf($))
+}
+
+// The group a draft belongs to is the one open when it is made, so a group switch before Next never mistakes a
+// pick for another group's. A draft stored before this had `group: null`; it keeps it and is never dropped by group.
+async function groupNow($: EngineInterface, taskId: string): Promise<string | null> {
+  const t = (await read($, snapshot))?.data?.tasks.find(x => x.id === taskId)
+  return t?.questions ? (await viewNow($, t)).label : null
+}
+
+async function chooseOption($: EngineInterface, taskId: string, qid: string, label: string) {
+  const group = await groupNow($, taskId)
+  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: label, custom: null, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
+}
+
+async function typeAnswer($: EngineInterface, taskId: string, qid: string, text: string) {
+  const custom = text.trim() || null
+  const group = await groupNow($, taskId)
+  await writeDrafts($, all => withDraft(all, taskId, qid, { custom, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
+}
+
+// Next: the open question's answer counts from here (a pick before Next is only a draft), and the next one opens.
+async function confirmQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion, move: boolean) {
+  const v = await viewNow($, t)
+  const d = draftOf(await draftsOf($), t.id, q.id)
+  const answer = answerOf(q, d)
+  if (answer === null) return
+  await writeDrafts($, all => withDraft(all, t.id, q.id, { confirmed: true, skipped: false, answer, pick: d?.pick ?? null, group: v.label }))
+  if (move) {
+    await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+    await ensureFull($, t.id)
+  }
+}
+
+async function skipQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
+  const v = await viewNow($, t)
+  await writeDrafts($, all => withDraft(all, t.id, q.id, { skipped: true, group: v.label }))
+  await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+  await ensureFull($, t.id)
+}
+
+// A row of the queue: open it for editing (a confirmed one goes back to being a draft).
+async function openQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
+  await writeDrafts($, all => (draftOf(all, t.id, q.id) ? withDraft(all, t.id, q.id, { confirmed: false, skipped: false }) : all))
+  await setQ($, t.id, { current: q.id })
+  await ensureFull($, t.id)
+}
+
+// A group's header: it becomes the open group, its skipped questions come back, its other questions are fetched.
+async function openGroup($: EngineInterface, t: StatusTask, label: string) {
+  await writeDrafts($, all => ({
+    ...all,
+    [t.id]: Object.fromEntries(Object.entries(all[t.id] ?? {}).map(([id, d]) => [id, (d.group ?? UNGROUPED) === label ? { ...d, skipped: false } : d])),
+  }))
+  await setQ($, t.id, { group: label, current: null })
+  if (label !== t.questions?.open_group) await loadGroup($, label)
+  await reconcile($)
+  await ensureFull($, t.id)
+}
+
+// Accept recommended: confirms the open group's reversible questions that have a recommendation. A critical one is left.
+async function acceptGroup($: EngineInterface, t: StatusTask) {
+  const v = await viewNow($, t)
+  const take = v.list.filter(q => acceptable(q, v.mine))
+  if (take.length === 0) return
+  await writeDrafts($, all => take.reduce((acc, q) => {
+    const rec = recommendedOf(q)?.label ?? null
+    return withDraft(acc, t.id, q.id, { pick: rec, custom: null, confirmed: true, skipped: false, answer: rec, group: v.label })
+  }, all))
+  await setQ($, t.id, { current: null })
+  await reconcile($)
+}
+
+// Send: every confirmed answer of the task, in one `orch answers`; on success, one wake. A failure keeps the drafts.
+async function sendTask($: EngineInterface, t: StatusTask, last?: StatusQuestion) {
+  if ((await readQ($)).sending[t.id]) return
+  if (last) await confirmQuestion($, t, last, false)
+  const pairs = confirmedOf((await draftsOf($))[t.id]).flatMap(([id, d]): [string, string][] => (d.answer ? [[id, d.answer]] : []))
+  if (pairs.length === 0) return
+  await setQ($, t.id, { sending: true, error: null })
+  const r = await runAnswers($, t.id, pairs, false)
+  if (!r.ok) {
+    const stale = r.stale
+    if (stale) await writeDrafts($, all => withoutDrafts(all, t.id, [stale]))
+    await setQ($, t.id, { sending: false, error: stale ? `${r.error}. The draft for ${stale} was dropped; send again.` : r.error })
+    return
+  }
+  await writeDrafts($, all => withoutDrafts(all, t.id, pairs.map(p => p[0])))
+  // Another folder's task belongs to another session: its answers are on disk, and this session is neither
+  // compacted nor woken for them.
+  if (t.in_cwd !== true) {
+    await setQ($, t.id, { sending: false, error: null })
+    await fetchStatus($)
+    $.ui.toast(`${plural(pairs.length, 'answer')} saved; that task's session reads them at its next checkpoint`)
+    return
+  }
+  // Compact, then send: with the option on, the conversation is compacted after the answers are on disk and
+  // before the wake. A refusal (something runs) skips the compaction and still wakes.
+  if ((await read($, compactSend)) === true) {
+    const why = await compactNow($, COMPACT_SEND_NOTE)
+    if (why) $.ui.toast(`Not compacted: ${why}`)
+  }
+  const woke = await wake($)
+  await setQ($, t.id, { sending: false, error: woke ? `The answers are saved; the agent could not be woken: ${woke}` : null })
+  await fetchStatus($)
+  $.ui.toast(`${plural(pairs.length, 'answer')} sent${woke ? '' : ', agent woken'}`)
 }
 
 // -- drawing helpers -----------------------------------------------------------------------------
@@ -299,20 +849,22 @@ const stepState = (s: StatusStep): ItemState => (s.done ? 'done' : s.current ? '
 
 const percentText = (t: StatusTask) => (t.overall.percent === null ? '' : `${t.overall.percent}%`)
 
+// What a Send does next: only a task of this folder has its agent woken here.
+const afterSend = (t: StatusTask) => (t.in_cwd !== true ? 'saved for that task\'s session' : isRunning(t) ? 'agent keeps working' : 'wakes the agent')
+
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
 type Bar = { label: string; percent: number; tail: string; kind: 'steps' | 'overall'; estimate: boolean }
 
 function bars(t: StatusTask): Bar[] {
   const out: Bar[] = []
-  const { done, total, percent } = t.steps
-  if (total !== null && done !== null && percent !== null) {
-    const label = t.program && t.milestone_no !== null ? `M${t.milestone_no} steps` : 'Steps'
-    out.push({ label, percent, tail: stepsTail(percent, done, total), kind: 'steps', estimate: false })
-  }
   const p = t.overall.percent
   if (p !== null) {
     out.push({ label: 'Overall', percent: p, tail: overallTail(p, t.overall.estimate), kind: 'overall', estimate: t.overall.estimate })
+  }
+  const { done, total, percent } = t.steps
+  if (total !== null && done !== null && percent !== null) {
+    out.push({ label: 'Steps', percent, tail: stepsTail(percent, done, total), kind: 'steps', estimate: false })
   }
   return out
 }
@@ -337,8 +889,27 @@ export const register: Register = on => {
       name: 'orch-pane',
       description: 'Show the orchestration tasks of this repo in a pane',
     })
+    try {
+      await $.tool.register({
+        name: COMPACT_TOOL,
+        description: 'Ask orch-pane to compact this conversation when the current turn ends, once. Use only at a checkpoint, when no subagent runs '
+          + 'and nothing is mid-spawn; it refuses otherwise. `instructions` says what the summary must keep. Afterwards you are woken: re-read the state from orch.',
+        inputSchema: { type: 'object', properties: { instructions: { type: 'string', description: 'What the summary should keep or stress' } }, additionalProperties: false },
+      })
+    } catch {
+      // No tool this session; the pane works without it.
+    }
+    compactAsked = null
+    compactRunning = false
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
     $.clock.every(SPIN_MS, () => void spinIfRunning($))
+    // A reload starts from a clean slate: what the poll saw last, and the auto-answers that failed.
+    lastOpen.clear()
+    autoFailed.clear()
+    autoDone.clear()
+    autoBusy = false
+    void loadAi($)
+    void loadDrafts($)
     void (async () => {
       const data = await fetchStatus($)
       if (data?.tasks.some(t => t.in_cwd) && !(await read($, dismissed))) {
@@ -358,9 +929,17 @@ export const register: Register = on => {
     return { text: 'Orchestration pane opened.' }
   })
 
+  // The tool the model calls to ask for a compaction (served below). Registered before the first prompt.
+  on('tool.call', { tool: COMPACT_TOOL_FULL }, async ($, e) => {
+    const given = e.instructions
+    return requestCompact($, typeof given === 'string' && given.trim() ? given.trim() : null)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     void refreshIfOpen($)
+    // A subagent's own turn.complete carries its agentId; only the main loop's end runs a requested compaction.
+    if (e.agentId === undefined) void runRequestedCompact($)
 
     return done
   })
@@ -377,18 +956,30 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // Mobile draws no Input (its table has none); the Ask section is left out there.
+    // Mobile draws no Input (its table has none); the Ask tab says so there.
     const Input = e.surface !== 'mobile' && 'Input' in elements ? elements.Input : undefined
     const plainMap = await read($, plain)
     const asked = await read($, ask)
     const snap = await read($, snapshot)
     const all = await read($, showAll)
     const open = await read($, expanded)
+    // A stored value of another shape reads as the default: all folded, AI summaries on.
+    const storedTab = await read($, tab)
+    const openTab = storedTab === 'history' || storedTab === 'ask' || storedTab === 'more' ? storedTab : null
+    const aiOn = (await read($, ai)) !== false
+    const autoOn = (await read($, auto)) === true
+    const notifyOn = (await read($, notify)) === true
+    const compactSendOn = (await read($, compactSend)) === true
+    const qs = await readQ($)
+    const stored = await read($, drafts)
+    const ds: Drafts = stored && typeof stored.byTask === 'object' && stored.byTask ? stored.byTask : {}
+    const storedHist = await read($, hist)
+    const search = { query: typeof storedHist?.query === 'string' ? storedHist.query : '', page: typeof storedHist?.page === 'number' ? storedHist.page : 0 }
     const tick = await read($, frame)
     const spin = SPINNER[tick % SPINNER.length]
     const now = snap.fetchedAt
     const width = Math.max(16, e.props.bodyColumns)
-    // Task content sits 2 in and a section's rows 2 more; an item's summary is 2 in from its row.
+    // A panel's border and padding take 4 columns; an item's summary sits 2 in from its row.
     const room = width - 4
     const everyTask = snap.data?.tasks ?? []
     const tasks = sortByAttention(everyTask.filter(t => all || t.in_cwd), now)
@@ -396,6 +987,17 @@ export const register: Register = on => {
     const isExpanded = (key: string, fallback = false) => open[key] ?? fallback
     const toggle = (key: string, fallback = false) => () =>
       update($, expanded, m => ({ ...m, [key]: !((m ?? {})[key] ?? fallback) }))
+
+    const panel = (children: RenderChildren, color?: 'warning') => (
+      <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={color ? undefined : true} paddingX={1} marginTop={1}>
+        {children}
+      </Box>
+    )
+    const blank = <Text> </Text>
+    const head = (left: RenderChildren, right: RenderChildren) => (
+      <Box flexDirection="row" justifyContent="space-between">{left}{right}</Box>
+    )
+    const subhead = (title: string) => <Text bold>{title}</Text>
 
     const mdRow = (l: MdLine) => (
       <Text>
@@ -408,11 +1010,13 @@ export const register: Register = on => {
 
     // An expanded summary: Haiku's plain text when it has one (a `raw` button shows the source), else the
     // source's markdown-lite with the summary's state under it. The source is reachable in every state.
+    // With AI summaries off it is always the source, with no summary button.
     const explained = (itemKey: string, input: string, source: string, cols: number) => {
+      const sourceRows = mdLite(source, cols).map(mdRow)
+      if (!aiOn) return sourceRows
       const entry = plainMap[textKey(input)]
       const rawKey = `raw:${itemKey}`
       const showRaw = isExpanded(rawKey)
-      const sourceRows = mdLite(source, cols).map(mdRow)
       const flip = (label: string) => (
         <Button key={rawKey} plain onPress={toggle(rawKey)}>
           <Text dimColor>{label}</Text>
@@ -436,41 +1040,22 @@ export const register: Register = on => {
     const summaryBlock = (itemKey: string, input: string, text: string | null, cols: number) =>
       text ? <Box flexDirection="column" paddingLeft={2}>{explained(itemKey, input, text, cols - 2)}</Box> : null
 
-    // Opening an item with a summary also asks for its plain-language summary.
+    // Opening an item with a summary also asks for its plain-language summary, unless AI summaries are off.
     const expandExplained = (key: string, input: string | null) => async () => {
       const opening = !isExpanded(key)
       await toggle(key)()
-      if (opening && input) await requestPlain($, input)
+      if (opening && input && aiOn) await requestPlain($, input)
     }
 
-    const section = (title: string, rows: RenderChildren[], extra?: string) => {
-      const shown = rows.filter(Boolean)
-      if (shown.length === 0) return null
-      return (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>
-            <Text bold color="suggestion">{title}</Text>
-            {extra ? <Text dimColor>{`  ${extra}`}</Text> : null}
-          </Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {shown}
-          </Box>
-        </Box>
-      )
-    }
-
-    const barRow = (t: StatusTask, b: Bar, layout: { labelW: number; barW: number }) => {
+    const barRow = (b: Bar, layout: { labelW: number; barW: number }) => {
       const filled = barCells(b.percent, layout.barW)
-      const cells =
-        b.kind === 'overall'
-          ? [<Text color="claude">{'█'.repeat(filled)}</Text>]
-          : [<Text color="success">{'█'.repeat(filled)}</Text>]
+      const color = b.kind === 'overall' ? 'claude' : 'success'
       return (
         <Text>
-          <Text bold>{b.label.padEnd(layout.labelW)}</Text>
-          {filled > 0 ? cells : null}
+          {b.label.padEnd(layout.labelW)}
+          {filled > 0 ? <Text color={color}>{'█'.repeat(filled)}</Text> : null}
           <Text dimColor>{'░'.repeat(layout.barW - filled)}</Text>
-          <Text color={b.estimate ? undefined : b.kind === 'overall' ? 'claude' : 'success'} dimColor={b.estimate}>
+          <Text color={b.estimate ? undefined : color} dimColor={b.estimate}>
             {`  ${b.tail}`}
           </Text>
         </Text>
@@ -514,60 +1099,62 @@ export const register: Register = on => {
       )
     }
 
-    // A list folded around its current item. Every fold row and the `▴ fold` row flip one switch; the first
-    // fold row carries the switch's own key, the others that key plus their first index (keys stay unique).
+    // A list with its done runs and its later items folded. `▴ fold done` sits above its run, `▴ fold` below
+    // its run. One switch per kind: the first fold row carries the switch's own key, any other that key plus
+    // its first index (keys stay unique).
     function foldedList<T>(t: StatusTask, list: 'ms' | 'steps', items: T[], stateOf: (x: T) => ItemState,
       idOf: (x: T) => string, row: (x: T) => RenderChildren): RenderChildren[] {
-      const key = `fold:${t.id}:${list}`
-      const rows = fold(items, stateOf)
-      if (!rows.some(r => r.kind !== 'item')) return items.map(row)
-      if (isExpanded(key)) {
-        return [...items.map(row), <Button key={key} plain onPress={toggle(key)}><Text dimColor>▴ fold</Text></Button>]
+      const doneKey = `fold:${t.id}:${list}:done`
+      const laterKey = `fold:${t.id}:${list}:later`
+      const used = new Set<string>()
+      const keyFor = (base: string, from: number) => {
+        if (used.has(base)) return `${base}:${from}`
+        used.add(base)
+        return base
       }
-      let first = true
-      return rows.map(r => {
+      return fold(items, stateOf).flatMap((r): RenderChildren[] => {
         if (r.kind === 'item') {
           const item = items[r.index]
-          return item === undefined ? null : row(item)
+          return item === undefined ? [] : [row(item)]
         }
-        const k = first ? key : `${key}:${r.from}`
-        first = false
+        const run = items.slice(r.from, r.to + 1)
         const [a, b] = [items[r.from], items[r.to]]
         if (r.kind === 'done') {
+          const k = keyFor(doneKey, r.from)
+          if (isExpanded(doneKey)) {
+            return [<Button key={k} plain onPress={toggle(doneKey)}><Text dimColor>▴ fold done</Text></Button>, ...run.map(row)]
+          }
           const range = a === undefined || b === undefined ? '' : `${idOf(a)}–${idOf(b)} `
-          return (
-            <Button key={k} plain onPress={toggle(key)}>
-              <Text color="success">{`✓ ${range}done`}</Text>
-            </Button>
-          )
+          return [<Button key={k} plain onPress={toggle(doneKey)}><Text color="success">{`✓ ${range}done`}</Text></Button>]
         }
-        return (
-          <Button key={k} plain onPress={toggle(key)}>
-            <Text dimColor>{`· ${r.to - r.from + 1} more`}</Text>
-          </Button>
-        )
+        const k = keyFor(laterKey, r.from)
+        if (isExpanded(laterKey)) {
+          return [...run.map(row), <Button key={k} plain onPress={toggle(laterKey)}><Text dimColor>▴ fold</Text></Button>]
+        }
+        return [<Button key={k} plain onPress={toggle(laterKey)}><Text dimColor>{`· ${run.length} more`}</Text></Button>]
       })
     }
 
-    const runningRows = (t: StatusTask, barW: number) => {
-      const spawn = t.running.last_spawn
-      const rows = t.running.roles.map(r => {
+    // One block per running role: the name and tier, the agent's own bar when it reports one, and its facts.
+    const agentBlocks = (t: StatusTask, barW: number) =>
+      t.running.roles.map((r, i) => {
         const mine = spawnOf(t, r.role)
         const since = mine && !mine.returned ? elapsed(mine.ts, now) : null
         // The spawn's own step list is current; a status file's `step` may be an older one.
         const last = r.step && !mine?.steps?.length ? `last: ${r.step}` : null
-        const tail = [since ? `running ${since}` : null, last].filter(Boolean)
+        const tail = [mine?.steps?.length ? `steps ${mine.steps.join(',')}` : null, since ? `running ${since}` : null, last].filter(Boolean)
         const pct = agentPct(r)
         const pctFilled = pct === null ? 0 : pct === 0 ? barW : barCells(pct, barW)
         const pctPalette = pct === 0 ? GREY : agentPalette(r.role)
         return (
-          <Box flexDirection="column">
-            <Text>
-              <Text color="claude">{`${spin} `}</Text>
-              <Text bold color="claude">{r.role ?? '?'}</Text>
-              {mine?.tier ? <Text color="permission">{`  ${mine.tier}`}</Text> : null}
-              {mine?.steps?.length ? <Text color="suggestion">{`  steps ${mine.steps.join(',')}`}</Text> : null}
-            </Text>
+          <Box flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+            {head(
+              <Text>
+                <Text color="claude">{`${spin} `}</Text>
+                <Text bold color="claude">{r.role ?? '?'}</Text>
+              </Text>,
+              mine?.tier ? <Text color="permission">{mine.tier}</Text> : null,
+            )}
             {pct !== null && (
               <Text>
                 {'  '}
@@ -582,7 +1169,32 @@ export const register: Register = on => {
           </Box>
         )
       })
-      if (rows.length === 0 && spawn) {
+
+    // The Agents block: three agents, then a fold row; or the last spawn when no role runs.
+    const agentsRows = (t: StatusTask, barW: number) => {
+      const spawn = t.running.last_spawn
+      const blocks = agentBlocks(t, barW)
+      const foldKey = `agents:${t.id}`
+      const isOpenAgents = isExpanded(foldKey)
+      const act = lastActivity(t)
+      const when = act ? ago(act.at, now) : null
+      const actText = act ? [act.who, act.text].filter(Boolean).join(' ') + (when ? ` · ${when}` : '') : null
+      const idle = now !== null && isStale(t, now) ? idleMinutes(t, now) : null
+      const running = blocks.length + (blocks.length === 0 && spawn && !spawn.returned ? 1 : 0)
+      const rows: RenderChildren[] = [
+        head(<Text bold>Agents</Text>, running > 0 ? <Text dimColor>{`${running} running`}</Text> : null),
+        ...(isOpenAgents ? blocks : blocks.slice(0, AGENTS_SHOWN)),
+      ]
+      if (blocks.length > AGENTS_SHOWN) {
+        rows.push(
+          <Box marginTop={1}>
+            <Button key={`agents-fold:${t.id}`} plain onPress={toggle(foldKey)}>
+              <Text dimColor>{isOpenAgents ? '▴ fold' : `· ${blocks.length - AGENTS_SHOWN} more`}</Text>
+            </Button>
+          </Box>,
+        )
+      }
+      if (blocks.length === 0 && spawn) {
         const parts = [`last spawn: ${spawn.role ?? '?'}`, spawn.tier, spawn.steps?.length ? `steps ${spawn.steps.join(',')}` : null,
           spawn.returned ? 'returned' : `running ${elapsed(spawn.ts, now) ?? ''}`.trim()]
         rows.push(
@@ -592,20 +1204,11 @@ export const register: Register = on => {
           </Text>,
         )
       }
+      if (idle !== null && now !== null) rows.push(<Text color="warning">{`idle ${minutesText(idle, now)} · nothing running`}</Text>)
+      if (blocks.length === 0 && !spawn && idle === null) rows.push(<Text dimColor>nothing running</Text>)
+      if (actText) rows.push(<Box marginTop={1}><Text dimColor>{clip(actText, room)}</Text></Box>)
+      if (t.error) rows.push(<Text color="error">{t.error}</Text>)
       return rows
-    }
-
-    const nowRows = (t: StatusTask, barW: number) => {
-      const act = lastActivity(t)
-      const when = act ? ago(act.at, now) : null
-      const actText = act ? [act.who, act.text].filter(Boolean).join(' ') + (when ? ` · ${when}` : '') : null
-      const idle = now !== null && isStale(t, now) ? idleMinutes(t, now) : null
-      return [
-        ...runningRows(t, barW),
-        actText ? <Text dimColor>{clip(actText, room)}</Text> : null,
-        idle !== null && now !== null ? <Text color="warning">{`idle ${minutesText(idle, now)} · nothing running`}</Text> : null,
-        t.error ? <Text color="error">{t.error}</Text> : null,
-      ]
     }
 
     // Folded: one clipped line. Open: the plain summary or the summary's markdown-lite lines under it.
@@ -624,21 +1227,335 @@ export const register: Register = on => {
       ]
     }
 
+    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+
+    // The status card: name and state, goal, facts, the Overall and Steps bars, and the Agents.
+    const card = (t: StatusTask, key: string) => {
+      const color = stateColor(t.state)
+      const name = all ? t.id : (t.slug ?? t.id)
+      const questions = t.questions_open ?? 0
+      const badge = questions > 0 ? `? ${plural(questions, 'question')}  ` : ''
+      const state = t.state_words ?? t.state
+      const facts = [placeText(t), t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
+      const progress = bars(t)
+      const layout = barLayout(room, progress)
+      return panel([
+        head(
+          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+            <Text color={color}>▾</Text>{' '}
+            <Text bold>{clip(name, Math.max(8, room - badge.length - state.length - 4))}</Text>
+          </Button>,
+          <Text>
+            {badge ? <Text color="warning">{badge}</Text> : null}
+            <Text color={color}>{state}</Text>
+          </Text>,
+        ),
+        blank,
+        ...goalRows(t),
+        facts ? <Text color="subtle">{clip(facts, room)}</Text> : null,
+        progress.length > 0 ? blank : null,
+        ...progress.map(b => barRow(b, layout)),
+        blank,
+        ...agentsRows(t, layout.barW),
+      ])
+    }
+
+    // The Needs you panel of a task: one open question at a time, its group's queue, and Send. Only a confirmed
+    // answer (Next, or Accept) is sent; the typed or picked one before that is a draft.
+    const needsYou = (t: StatusTask) => {
+      const qq = t.questions
+      if (!qq || qq.counts.open === 0) return null
+      const v = viewOf(t, qs, ds)
+      const foldKey = `needs:${t.id}`
+      const folded = isExpanded(foldKey)
+      const pending = qq.counts.open
+      const confirmedAll = confirmedOf(v.mine).length
+      const stay = pending - confirmedAll
+      const grouped = qq.groups.some(g => g.group !== null && g.counts.open > 0)
+      const sending = qs.sending[t.id] === true
+      const err = qs.error[t.id]
+      const title = head(
+        <Button key={`needs-fold:${t.id}`} plain onPress={toggle(foldKey)}>
+          <Text color="subtle">{folded ? '▸ ' : '▾ '}</Text>
+          <Text bold color="warning">? Needs you</Text>
+        </Button>,
+        <Text dimColor>{`${pending} pending`}</Text>,
+      )
+      if (folded) return panel([title], 'warning')
+
+      const label = (q: StatusQuestion) => clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 4)
+      const optionRows = (q: StatusQuestion) => {
+        const picked = pickedLabel(q, v.mine[q.id])
+        return q.options.map((o, i) => {
+          const selected = picked === o.label
+          return (
+            <Box flexDirection="column" marginTop={1}>
+              <Button key={`${t.id}:${q.id}:o${i}`} plain onPress={() => chooseOption($, t.id, q.id, o.label)}>
+                <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
+                <Text bold={selected ? true : undefined}>{o.label}</Text>
+                {o.recommended ? <Text dimColor> · Recommended</Text> : null}
+              </Button>
+              <Box paddingLeft={2}><Text dimColor>{optionNote(o)}</Text></Box>
+            </Box>
+          )
+        })
+      }
+
+      // Hold on closes every list of options: it pauses the question, and sent it records the answer "Hold on".
+      const holdRow = (q: StatusQuestion) => {
+        const selected = pickedLabel(q, v.mine[q.id]) === HOLD_LABEL
+        return (
+          <Box flexDirection="column" marginTop={1}>
+            <Button key={`${t.id}:${q.id}:hold`} plain onPress={() => chooseOption($, t.id, q.id, HOLD_LABEL)}>
+              <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
+              <Text bold={selected ? true : undefined}>{HOLD_LABEL}</Text>
+            </Button>
+            <Box paddingLeft={2}><Text dimColor>{HOLD_NOTE}</Text></Box>
+          </Box>
+        )
+      }
+
+      const questionOpen = (q: StatusQuestion) => {
+        const d = v.mine[q.id]
+        const answer = answerOf(q, d)
+        const ready = answer !== null
+        const others = nextInQueue(v.order, v.mine, q.id)
+        const count = confirmedAll + (ready ? 1 : 0)
+        const critical = isCritical(q)
+        return (
+          <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+            <Text>{q.text}</Text>
+            <Text color={critical ? 'warning' : undefined} dimColor={critical ? undefined : true}>{metaText(q)}</Text>
+            {hasOptions(q) ? optionRows(q) : <Box marginTop={1}><Text dimColor>Loading the options…</Text></Box>}
+            {needsHoldRow(q) ? holdRow(q) : null}
+            {Input ? (
+              <Box marginTop={1}>
+                <Input key={`${t.id}:${q.id}:own`} placeholder="Or type your own answer…" submitLabel="use"
+                  value={d?.custom ?? undefined} onSubmit={value => typeAnswer($, t.id, q.id, value)} />
+              </Box>
+            ) : null}
+            {d?.custom ? <Text color="suggestion">{`● Your answer: ${d.custom}`}</Text> : null}
+            <Box flexDirection="row" marginTop={1} columnGap={2}>
+              {!ready
+                ? <Text color="warning">Choose an option first</Text>
+                : others === null
+                  ? <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t, q)}>{`Send ${plural(count, 'answer')}`}</Button>
+                  : <Button key={`next:${t.id}`} variant="primary" onPress={() => confirmQuestion($, t, q, true)}>Next</Button>}
+              {others !== null ? <Button key={`skip:${t.id}`} onPress={() => skipQuestion($, t, q)}>Skip for now</Button> : null}
+              {ready && others === null ? <Text dimColor>{afterSend(t)}</Text> : null}
+            </Box>
+          </Box>
+        )
+      }
+
+      const rowFor = (q: StatusQuestion) => {
+        const d = v.mine[q.id]
+        const isCurrent = v.current?.id === q.id
+        const mark = d?.confirmed ? '✓ ' : isCurrent ? '▾ ' : '▸ '
+        return (
+          <Button key={`row:${t.id}:${q.id}`} plain onPress={() => openQuestion($, t, q)}>
+            <Text color={d?.confirmed ? 'success' : 'subtle'}>{mark}</Text>
+            <Text bold={isCurrent ? true : undefined}>{label(q)}</Text>
+            {d?.skipped && !d.confirmed ? <Text dimColor>  skipped</Text> : null}
+            {d?.confirmed ? <Text dimColor>{clip(`  → ${d.answer ?? ''}`, 24)}</Text> : null}
+          </Button>
+        )
+      }
+
+      // The open group's queue: every row when it is short, else the open question, the next one and a count.
+      const queue = v.order.flatMap(id => v.byId.get(id) ?? [])
+      const waiting = queue.filter(q => !v.mine[q.id]?.confirmed && !v.mine[q.id]?.skipped && q.id !== v.current?.id)
+      const queueRows = () => {
+        if (!grouped && queue.length <= ROWS_SHOWN) {
+          return queue.map(q => (
+            <Box flexDirection="column" marginTop={1}>
+              {rowFor(q)}
+              {v.current?.id === q.id ? questionOpen(q) : null}
+            </Box>
+          ))
+        }
+        const cur = v.current
+        return [
+          cur ? <Box flexDirection="column" marginTop={1}><Text bold><Text color="subtle">▾ </Text>{label(cur)}</Text>{questionOpen(cur)}</Box> : null,
+          ...waiting.slice(0, 1).map(q => <Box marginTop={1}>{rowFor(q)}</Box>),
+          waiting.length > 1 ? <Text dimColor>{`· ${waiting.length - 1} more`}</Text> : null,
+        ]
+      }
+
+      const groupRows = () => qq.groups.filter(g => g.counts.open > 0).map(g => {
+        const mine = Object.values(v.mine).filter(d => (d.group ?? UNGROUPED) === g.label)
+        const ready = mine.filter(d => d.confirmed).length
+        const skipped = mine.filter(d => d.skipped && !d.confirmed).length
+        const isActive = g.label === v.label
+        const right = [`${g.counts.open - ready} left`, skipped ? `${skipped} skipped` : null, ready ? `${ready} ready` : null].filter(Boolean).join(' · ')
+        return (
+          <Box flexDirection="column" marginTop={1}>
+            {head(
+              <Button key={`group:${t.id}:${g.label}`} plain onPress={() => openGroup($, t, g.label)}>
+                <Text color="subtle">{isActive ? '▾ ' : '▸ '}</Text>
+                <Text bold={isActive ? true : undefined}>{clip(g.label, Math.max(8, room - right.length - 6))}</Text>
+              </Button>,
+              <Text dimColor>{right}</Text>,
+            )}
+            {isActive ? <Box flexDirection="column" paddingLeft={2}>{queueRows()}</Box> : null}
+          </Box>
+        )
+      })
+
+      const sent = qq.counts.answered + qq.counts.assumed
+      const canAccept = v.list.filter(q => acceptable(q, v.mine)).length
+      const acceptText = grouped ? `Accept recommended in ${v.label ?? ''} (${canAccept})` : `Accept all recommended (${canAccept})`
+      const sendText = stay > 0 ? `Send ${confirmedAll} now · ${stay} stay open` : `Send ${plural(confirmedAll, 'answer')}`
+      return panel([
+        title,
+        ...(grouped
+          ? [blank, <Text>{'█'.repeat(barCells((sent / Math.max(1, sent + pending)) * 100, 16))}<Text dimColor>{'░'.repeat(16 - barCells((sent / Math.max(1, sent + pending)) * 100, 16))}{`  ${sent} of ${sent + pending} sent`}</Text></Text>, ...groupRows()]
+          : queueRows()),
+        v.current === null && confirmedAll > 0
+          ? <Box marginTop={1} flexDirection="row" columnGap={2}>
+              <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t)}>{`Send ${plural(confirmedAll, 'answer')}`}</Button>
+              <Text dimColor>{stay > 0 ? `${stay} stay open` : afterSend(t)}</Text>
+            </Box>
+          : null,
+        canAccept > 0 ? <Box marginTop={1}><Button key={`accept:${t.id}`} plain onPress={() => acceptGroup($, t)}><Text dimColor>{acceptText}</Text></Button></Box> : null,
+        confirmedAll > 0 && v.current !== null
+          ? <Box marginTop={1}><Button key={`send-now:${t.id}`} plain onPress={() => sendTask($, t)}><Text dimColor>{sendText}</Text></Button></Box>
+          : null,
+        sending ? <Text color="claude">{`${spin} sending…`}</Text> : null,
+        err ? <Text color="warning">{clip(err, room * 2)}</Text> : null,
+      ], 'warning')
+    }
+
+    // Milestones and the current milestone's steps, folded around the current item.
+    const workPanel = (t: StatusTask) => {
+      const milestones = t.milestones?.items ?? []
+      const steps = t.steps.items
+      const count = (items: { done: boolean }[]) => countTail(items.filter(i => i.done).length, items.length)
+      const blocks: RenderChildren[][] = []
+      if (milestones.length > 0) {
+        blocks.push([
+          head(<Text bold>Milestones</Text>, <Text dimColor>{count(milestones.map(m => ({ done: m.state === 'done' })))}</Text>),
+          ...foldedList(t, 'ms', milestones, m => m.state, m => `M${m.n}`, m => milestoneRow(t, m)),
+        ])
+      }
+      if (steps.length > 0) {
+        blocks.push([
+          head(<Text bold>{t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'}</Text>, <Text dimColor>{count(steps)}</Text>),
+          ...foldedList(t, 'steps', steps, stepState, s => s.id, s => stepRow(t, s)),
+        ])
+      }
+      return blocks.length === 0 ? null : panel(blocks.flatMap((b, i) => (i === 0 ? b : [blank, ...b])))
+    }
+
+    const taskBlock = (t: StatusTask, index: number) => {
+      const key = `task:${t.id}`
+      if (taskOpen(t)) return <Box flexDirection="column">{card(t, key)}{needsYou(t)}{workPanel(t)}</Box>
+      // Folded tasks stack tight.
+      const prev = tasks[index - 1]
+      const gap = index === 0 || (prev && taskOpen(prev)) ? 1 : 0
+      const color = stateColor(t.state)
+      const name = all ? t.id : (t.slug ?? t.id)
+      const questions = t.questions_open ?? 0
+      return (
+        <Box flexDirection="column" marginTop={gap}>
+          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+            <Text color={color}>▸</Text>{' '}
+            <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
+            {'  '}
+            <Text color={color}>{t.state_words ?? t.state}</Text>
+            {questions > 0 ? <Text color="warning">{`  ? ${plural(questions, 'question')}`}</Text> : null}
+            <Text dimColor>{percentText(t) ? `  ${percentText(t)}` : ''}</Text>
+          </Button>
+        </Box>
+      )
+    }
+
+    const empty = snap.data && tasks.length === 0
+      ? all ? 'No active tasks.' : 'No orchestration task for this folder.'
+      : null
+    const staleSince = snap.error && snap.data ? (snap.okAt ?? snap.fetchedAt) : null
+
+    // The tabs act on the shown tasks as a whole; History reads the first open one.
+    const primary = tasks.find(taskOpen) ?? tasks[0]
+
+    const historyTab = () => {
+      const all = historyRows(primary?.questions?.history ?? [], '')
+      const found = historyRows(primary?.questions?.history ?? [], search.query)
+      const pages = pageCount(found.length)
+      const page = Math.min(search.page, pages - 1)
+      const finder = Input && (all.length > HISTORY_PAGE || search.query) ? (
+        <Box marginBottom={1}>
+          <Input key="hist-search" placeholder="Search answered questions…" submitLabel="search" value={search.query}
+            onSubmit={value => update($, hist, () => ({ query: value.trim(), page: 0 }))} />
+        </Box>
+      ) : null
+      if (found.length === 0) return [finder, <Text dimColor>{search.query ? 'No matching questions.' : 'No answered questions yet.'}</Text>]
+      const go = (to: number) => update($, hist, h => ({ query: (h ?? search).query, page: to }))
+      const pager = pages > 1 ? (
+        <Box flexDirection="row" columnGap={2} marginTop={1}>
+          {page > 0 ? <Button key="hist-prev" plain onPress={() => go(page - 1)}><Text dimColor>‹ Newer</Text></Button> : null}
+          <Text dimColor>{`Page ${page + 1} of ${pages}`}</Text>
+          {page < pages - 1 ? <Button key="hist-next" plain onPress={() => go(page + 1)}><Text dimColor>Older ›</Text></Button> : null}
+        </Box>
+      ) : null
+      const rows = found.slice(page * HISTORY_PAGE, (page + 1) * HISTORY_PAGE).map(q => {
+        const key = `hist:${q.id}`
+        const auto_ = q.status === 'assumed'
+        return (
+          <Box flexDirection="column">
+            {head(
+              <Button key={key} plain onPress={toggle(key)}>
+                <Text color="subtle">{isExpanded(key) ? '▾ ' : '▸ '}</Text>
+                {clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 14)}
+              </Button>,
+              auto_ ? <Text color="permission">◆ Auto</Text> : <Text color="success">✓ Answered</Text>,
+            )}
+            {isExpanded(key) ? (
+              <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
+                {mdLite(q.text, room - 2).map(mdRow)}
+                <Text color="suggestion">{`→ ${q.answer ?? ''}`}</Text>
+                <Text dimColor>{[q.group, q.answered].filter(Boolean).join(' · ')}</Text>
+              </Box>
+            ) : null}
+          </Box>
+        )
+      })
+      return [finder, ...rows, pager]
+    }
+
+    const askTab = () => {
+      if (!Input) return [<Text dimColor>Ask is not available here.</Text>]
+      const rows: RenderChildren[] = [
+        <Input key="ask" placeholder="Ask about these tasks…" submitLabel="ask" onSubmit={value => askHaiku($, value, tasks)} />,
+      ]
+      if (asked.state !== 'idle') {
+        rows.push(<Text dimColor>{clip(`Q: ${asked.question}`, room)}</Text>)
+        if (asked.state === 'busy') rows.push(<Text color="claude">{`${spin} thinking…`}</Text>)
+        if (asked.state === 'done') rows.push(...mdLite(asked.answer, room).map(mdRow))
+        if (asked.state === 'error') rows.push(<Text color="error">{`no answer: ${asked.reason}`}</Text>)
+        rows.push(
+          <Button key="ask-clear" plain onPress={() => clearAsk($)}>
+            <Text dimColor>clear</Text>
+          </Button>,
+        )
+      }
+      return rows
+    }
+
     // The code index of this folder, folded to one line (state, size, when it was revised); open, its details.
-    const indexRows = (t: StatusTask) => {
-      if (t.in_cwd !== true) return []
+    const indexRows = () => {
       const ix = snap.index
       if (!ix) return snap.indexNote ? [<Text dimColor>{clip(snap.indexNote, room)}</Text>] : []
       const look = indexLook(ix)
       const isOpenIndex = isExpanded('index')
-      const head = indexHeadline(ix, now)
+      const headline = indexHeadline(ix, now)
       const rows = indexDetails(ix, now)
       const labelW = Math.max(0, ...rows.map(r => r.label.length)) + 2
       return [
-        <Button key={`index:${t.id}`} plain onPress={toggle('index')}>
+        <Button key="index" plain onPress={toggle('index')}>
           <Text color="subtle">{isOpenIndex ? '▾ ' : '▸ '}</Text>
           <Text color={look.color} bold>{look.words}</Text>
-          {head ? <Text dimColor>{clip(` · ${head}`, Math.max(8, room - 2 - look.words.length))}</Text> : null}
+          {headline ? <Text dimColor>{clip(` · ${headline}`, Math.max(8, room - 2 - look.words.length))}</Text> : null}
           {indexNeedsAnswerWarning(ix) ? <Text color="warning">{'  ⚠ stale answers'}</Text> : null}
         </Button>,
         isOpenIndex ? (
@@ -656,107 +1573,58 @@ export const register: Register = on => {
       ]
     }
 
-    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+    const check = (key: string, on_: boolean, label: string, note: string | null, press: () => void) => (
+      <Box flexDirection="column" marginBottom={1}>
+        <Button key={key} plain onPress={press}>
+          <Text color={on_ ? 'success' : undefined}>{on_ ? '[x] ' : '[ ] '}</Text>{label}
+        </Button>
+        {note ? <Box paddingLeft={4}><Text dimColor>{note}</Text></Box> : null}
+      </Box>
+    )
 
-    const taskBlock = (t: StatusTask, index: number) => {
-      const key = `task:${t.id}`
-      const isOpenTask = taskOpen(t)
-      // Folded tasks stack tight; an open task gets room around it.
-      const prev = tasks[index - 1]
-      const gap = index === 0 ? 1 : isOpenTask || (prev && taskOpen(prev)) ? 2 : 0
-      const color = stateColor(t.state)
-      const facts = [t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
-      const name = all ? t.id : (t.slug ?? t.id)
-      const questions = t.questions_open ?? 0
-      const progress = bars(t)
-      const layout = barLayout(room, progress)
-      const milestones = t.milestones?.items ?? []
-      const steps = t.steps.items
-      const msDone = t.milestones?.total ? `${t.milestones.done}/${t.milestones.total} done` : undefined
-      return (
-        <Box flexDirection="column" marginTop={gap}>
-          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
-            <Text color={color}>{isOpenTask ? '▾' : '▸'}</Text>{' '}
-            <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
-            {'  '}
-            <Text color={color}>{t.state_words ?? t.state}</Text>
-            {questions > 0 ? <Text color="warning">{`  ? ${plural(questions, 'question')}`}</Text> : null}
-            <Text dimColor>{percentText(t) ? `  ${percentText(t)}` : ''}</Text>
-          </Button>
-          {isOpenTask && (
-            <Box flexDirection="column" paddingLeft={2}>
-              {placeText(t) ? (
-                <Box marginTop={1}>
-                  <Text color="suggestion">{clip(placeText(t), width - 4)}</Text>
-                </Box>
-              ) : null}
-              {facts ? <Text color="subtle">{facts}</Text> : null}
-              {section('Goal', goalRows(t))}
-              {section('Index', indexRows(t))}
-              {section('Now', nowRows(t, layout.barW))}
-              {section('Progress', progress.map(b => barRow(t, b, layout)))}
-              {milestones.length > 0
-                ? section('Milestones', foldedList(t, 'ms', milestones, m => m.state, m => `M${m.n}`, m => milestoneRow(t, m)), msDone)
-                : null}
-              {steps.length > 0
-                ? section(t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps',
-                  foldedList(t, 'steps', steps, stepState, s => s.id, s => stepRow(t, s)))
-                : null}
-            </Box>
-          )}
-        </Box>
-      )
-    }
-
-    const empty = snap.data && tasks.length === 0
-      ? all ? 'No active tasks.' : 'No orchestration task for this folder.'
-      : null
-    const staleSince = snap.error && snap.data ? (snap.okAt ?? snap.fetchedAt) : null
-
-    const askRows = () => {
-      if (!Input) return null
-      const rows: RenderChildren[] = [
-        <Input key="ask" placeholder="Ask about these tasks…" submitLabel="ask" onSubmit={value => askHaiku($, value, tasks)} />,
+    const moreTab = () => {
+      const index = indexRows()
+      return [
+        ...(index.length > 0 ? [subhead('Index'), ...index, blank] : []),
+        subhead('Advanced options'),
+        blank,
+        check('opt-ai', aiOn, 'AI summaries: goal, milestones, steps', 'off shows the original text', () => toggleAi($)),
+        check('opt-auto', autoOn, 'Auto-answer with recommended', 'reversible questions only; History shows ◆ Auto', () => toggleAuto($)),
+        check('opt-notify', notifyOn, 'Notify me when a question arrives', null, () => toggleNotify($)),
+        check('opt-compact-send', compactSendOn, 'Compact, then send', 'sending answers compacts the conversation first; skipped while an agent runs', () => toggleCompactSend($)),
+        ...(snap.about
+          ? [
+              subhead('About'),
+              ...snap.about.map(p => (
+                <Text key={p.name}>
+                  <Text dimColor>{p.name.padEnd(11)}</Text>
+                  {p.installed
+                    ? <Text>{`v${p.version}`}{p.commit ? <Text dimColor>{`  ${p.commit}`}</Text> : null}</Text>
+                    : <Text color="warning">not installed</Text>}
+                </Text>
+              )),
+            ]
+          : []),
       ]
-      if (asked.state !== 'idle') {
-        rows.push(<Text dimColor>{clip(`Q: ${asked.question}`, width - 2)}</Text>)
-        if (asked.state === 'busy') rows.push(<Text color="claude">{`${spin} thinking…`}</Text>)
-        if (asked.state === 'done') rows.push(...mdLite(asked.answer, width - 2).map(mdRow))
-        if (asked.state === 'error') rows.push(<Text color="error">{`no answer: ${asked.reason}`}</Text>)
-        rows.push(
-          <Button key="ask-clear" plain onPress={() => clearAsk($)}>
-            <Text dimColor>clear</Text>
-          </Button>,
-        )
-      }
-      return (
-        <Box flexDirection="column" marginTop={2}>
-          <Text bold color="suggestion">Ask</Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {rows}
-          </Box>
-        </Box>
-      )
     }
 
-    const aboutRows = () => {
-      if (!snap.about) return null
-      return (
-        <Box flexDirection="column" marginTop={2}>
-          <Text bold color="suggestion">About</Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {snap.about.map(p => (
-              <Text key={p.name}>
-                <Text dimColor>{p.name.padEnd(11)}</Text>
-                {p.installed
-                  ? <Text>{`v${p.version}`}{p.commit ? <Text dimColor>{`  ${p.commit}`}</Text> : null}</Text>
-                  : <Text color="warning">not installed</Text>}
-              </Text>
-            ))}
-          </Box>
-        </Box>
-      )
-    }
+    const TABS: { id: Tab; label: string }[] = [
+      { id: 'history', label: 'History' },
+      { id: 'ask', label: 'Ask' },
+      { id: 'more', label: 'More' },
+    ]
+    const tabBar = (
+      <Box flexDirection="row" flexWrap="wrap">
+        {TABS.flatMap((t, i) => [
+          i > 0 ? <Text dimColor>{' │ '}</Text> : null,
+          <Button key={`tab:${t.id}`} plain onPress={() => update($, tab, cur => (cur === t.id ? null : t.id))}>
+            <Text bold={openTab === t.id ? true : undefined} underline={openTab === t.id ? true : undefined}
+              color={openTab === t.id ? 'suggestion' : undefined} dimColor={openTab === t.id ? undefined : true}>{t.label}</Text>
+          </Button>,
+        ])}
+      </Box>
+    )
+    const tabBody = openTab === null ? [] : [blank, ...{ history: historyTab, ask: askTab, more: moreTab }[openTab]()]
 
     return (
       <Box flexDirection="column">
@@ -768,8 +1636,7 @@ export const register: Register = on => {
         {!snap.data && !snap.error && <Text dimColor>Loading…</Text>}
         {empty && <Text dimColor>{empty}</Text>}
         {tasks.map(taskBlock)}
-        {askRows()}
-        {aboutRows()}
+        {panel([tabBar, ...tabBody])}
       </Box>
     )
   })
