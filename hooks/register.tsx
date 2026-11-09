@@ -7,8 +7,8 @@ import {
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
   HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
-  historyRows, isCritical, mergeOrder, metaText, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
-  recommendedOf, staleQuestion, UNGROUPED,
+  historyRows, isCritical, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
+  recommendedOf, skipFor, staleQuestion, UNGROUPED, HOLD_LABEL, HOLD_NOTE,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -44,12 +44,13 @@ const auto = atom({ plugin: 'orch-pane', key: 'auto' } as const, false)
 const EMPTY_DRAFTS: { loaded: boolean; byTask: Drafts } = { loaded: false, byTask: {} }
 const drafts = atom({ plugin: 'orch-pane', key: 'drafts' } as const, EMPTY_DRAFTS, { shape: 'drafts-1' })
 const DRAFTS_KEY = 'drafts'
-const EMPTY_Q: QState = { current: {}, group: {}, order: {}, fetched: {}, sending: {}, error: {} }
+const EMPTY_Q: QState = { current: {}, group: {}, order: {}, fetched: {}, full: {}, sending: {}, error: {} }
 const qstate = atom({ plugin: 'orch-pane', key: 'qstate' } as const, EMPTY_Q)
 const hist = atom({ plugin: 'orch-pane', key: 'hist' } as const, { query: '', page: 0 })
 
 const AGENTS_SHOWN = 3
 const ROWS_SHOWN = 8
+const FULL_KEPT = 400
 const SPIN_MS = 120
 const FRAME_WRAP = 3600
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -252,27 +253,56 @@ async function whereIsOrch($: EngineInterface): Promise<Where | null> {
   return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd() }
 }
 
-// Another group's open questions, in full: `orch status --json --question-group <label>`, kept by task and group.
-async function loadGroup($: EngineInterface, label: string) {
+// `orch status --json --question-group <label>` (from the `skip`-th question on in full): the data, or null.
+async function runGroup($: EngineInterface, label: string, skip: number): Promise<StatusJson | null> {
   const where = await whereIsOrch($)
-  if (!where) return
+  if (!where) return null
   let ran
   try {
-    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, '--question-group', label],
-      { timeoutMs: RUN_TIMEOUT_MS })
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, '--question-group', label,
+      ...(skip > 0 ? ['--question-skip', String(skip)] : [])], { timeoutMs: RUN_TIMEOUT_MS })
   } catch {
-    return
+    return null
   }
-  if (ran.exitCode !== 0) return
-  let data: StatusJson
+  if (ran.exitCode !== 0) return null
   try {
-    data = JSON.parse(ran.stdout) as StatusJson
+    const data = JSON.parse(ran.stdout) as StatusJson
+    return data && data.schema === 1 && Array.isArray(data.tasks) ? data : null
   } catch {
-    return
+    return null
   }
-  if (!data || data.schema !== 1 || !Array.isArray(data.tasks)) return
+}
+
+// Another group's open questions, kept by task and group.
+async function loadGroup($: EngineInterface, label: string) {
+  const data = await runGroup($, label, 0)
+  if (!data) return
   const got = Object.fromEntries(data.tasks.map(t => [groupKey(t.id, label), t.questions?.open ?? []]))
   await patchQ($, q => ({ ...q, fetched: { ...q.fetched, ...got } }))
+}
+
+const fullBusy = new Set<string>()
+
+// A long list draws its tail without options. When the open question or the next one lacks them, asks orch for the
+// window that starts there and keeps the full entries (`--question-skip`).
+async function ensureFull($: EngineInterface, taskId: string) {
+  if (fullBusy.has(taskId)) return
+  const t = (await read($, snapshot))?.data?.tasks.find(x => x.id === taskId)
+  if (!t?.questions) return
+  const q = await readQ($)
+  const v = viewOf(t, q, await draftsOf($))
+  const skip = skipFor(v.list, v.order, v.mine, v.current?.id ?? null)
+  if (skip === null || v.label === null) return
+  fullBusy.add(taskId)
+  try {
+    const data = await runGroup($, v.label, skip)
+    if (!data) return
+    const got: Record<string, StatusQuestion> = {}
+    for (const x of data.tasks) for (const e of x.questions?.open ?? []) if (hasOptions(e)) got[groupKey(x.id, e.id)] = e
+    await patchQ($, s => ({ ...s, full: { ...(Object.keys(s.full).length > FULL_KEPT ? {} : s.full), ...got } }))
+  } finally {
+    fullBusy.delete(taskId)
+  }
 }
 
 type Sent = { ok: true } | { ok: false; error: string; stale: string | null }
@@ -307,7 +337,7 @@ async function wake($: EngineInterface): Promise<string | null> {
 function viewOf(t: StatusTask, q: QState, ds: Drafts) {
   const qq = t.questions
   const label = activeGroupOf(t, q.group[t.id] ?? null)
-  const list = openListOf(t, q.group[t.id] ?? null, q.fetched)
+  const list = openListOf(t, q.group[t.id] ?? null, q.fetched, q.full)
   const byId = new Map(list.map(x => [x.id, x]))
   const seen = (q.order[t.id] ?? []).filter(id => byId.has(id))
   const order = mergeOrder(seen, list.map(x => x.id))
@@ -412,6 +442,7 @@ async function afterFetch($: EngineInterface, data: StatusJson) {
     }
     for (const label of wanted) await loadGroup($, label)
     await reconcile($)
+    for (const t of data.tasks) await ensureFull($, t.id)
     await notifyNew($, data)
     await autoPass($)
   } catch {
@@ -607,19 +638,24 @@ async function confirmQuestion($: EngineInterface, t: StatusTask, q: StatusQuest
   const answer = answerOf(q, d)
   if (answer === null) return
   await writeDrafts($, all => withDraft(all, t.id, q.id, { confirmed: true, skipped: false, answer, pick: d?.pick ?? null, group: v.label }))
-  if (move) await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+  if (move) {
+    await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+    await ensureFull($, t.id)
+  }
 }
 
 async function skipQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
   const v = await viewNow($, t)
   await writeDrafts($, all => withDraft(all, t.id, q.id, { skipped: true, group: v.label }))
   await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+  await ensureFull($, t.id)
 }
 
 // A row of the queue: open it for editing (a confirmed one goes back to being a draft).
 async function openQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
   await writeDrafts($, all => (draftOf(all, t.id, q.id) ? withDraft(all, t.id, q.id, { confirmed: false, skipped: false }) : all))
   await setQ($, t.id, { current: q.id })
+  await ensureFull($, t.id)
 }
 
 // A group's header: it becomes the open group, its skipped questions come back, its other questions are fetched.
@@ -631,6 +667,7 @@ async function openGroup($: EngineInterface, t: StatusTask, label: string) {
   await setQ($, t.id, { group: label, current: null })
   if (label !== t.questions?.open_group) await loadGroup($, label)
   await reconcile($)
+  await ensureFull($, t.id)
 }
 
 // Accept recommended: confirms the open group's reversible questions that have a recommendation. A critical one is left.
@@ -1105,6 +1142,20 @@ export const register: Register = on => {
         })
       }
 
+      // Hold on closes every list of options: it pauses the question, and sent it records the answer "Hold on".
+      const holdRow = (q: StatusQuestion) => {
+        const selected = pickedLabel(q, v.mine[q.id]) === HOLD_LABEL
+        return (
+          <Box flexDirection="column" marginTop={1}>
+            <Button key={`${t.id}:${q.id}:hold`} plain onPress={() => chooseOption($, t.id, q.id, HOLD_LABEL)}>
+              <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
+              <Text bold={selected ? true : undefined}>{HOLD_LABEL}</Text>
+            </Button>
+            <Box paddingLeft={2}><Text dimColor>{HOLD_NOTE}</Text></Box>
+          </Box>
+        )
+      }
+
       const questionOpen = (q: StatusQuestion) => {
         const d = v.mine[q.id]
         const answer = answerOf(q, d)
@@ -1116,9 +1167,8 @@ export const register: Register = on => {
           <Box flexDirection="column" paddingLeft={2} marginTop={1}>
             <Text>{q.text}</Text>
             <Text color={critical ? 'warning' : undefined} dimColor={critical ? undefined : true}>{metaText(q)}</Text>
-            {hasOptions(q)
-              ? optionRows(q)
-              : <Box marginTop={1}><Text dimColor>The options load once the answers so far are sent.</Text></Box>}
+            {hasOptions(q) ? optionRows(q) : <Box marginTop={1}><Text dimColor>Loading the options…</Text></Box>}
+            {needsHoldRow(q) ? holdRow(q) : null}
             {Input ? (
               <Box marginTop={1}>
                 <Input key={`${t.id}:${q.id}:own`} placeholder="Or type your own answer…" submitLabel="use"

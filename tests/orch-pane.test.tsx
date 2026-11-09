@@ -7,7 +7,7 @@ import {
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, spawnOf, sparkline, stepsTail, textKey,
   WAKE_TEXT, acceptable, answerOf, answersArgv, autoPairs, historyRows, isCritical, mergeOrder, metaText, nextInQueue, optionNote,
-  pageCount, pickCurrent, pickedLabel, staleQuestion,
+  pageCount, pickCurrent, pickedLabel, staleQuestion, needsHoldRow, openListOf, skipFor,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
 import type { Draft, IndexStatus, StatusQuestion, StatusRole, StatusTask } from '../types'
@@ -73,7 +73,7 @@ type World = {
   // `orch answers` runs (its argv), its answer, and what the orch would then print for `status`.
   answers: string[][]; answered: Ran; onAnswers: (argv: string[]) => void
   // `orch status --question-group <label>`: the stdout to give by label, and the runs.
-  groups: Record<string, string>; groupRuns: string[][]
+  groups: Record<string, string | ((skip: number) => string)>; groupRuns: string[][]
   wakes: string[]; notes: string[]
 }
 
@@ -131,7 +131,9 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
     const group = e.argv.indexOf('--question-group')
     if (group >= 0) {
       w.groupRuns.push([...e.argv])
-      const out = w.groups[e.argv[group + 1] ?? '']
+      const given = w.groups[e.argv[group + 1] ?? '']
+      const skip = e.argv.indexOf('--question-skip')
+      const out = typeof given === 'function' ? given(skip >= 0 ? Number(e.argv[skip + 1]) : 0) : given
       return { value: { exitCode: out === undefined ? 1 : 0, stdout: out ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
     const isIndex = e.argv.some(a => /orch-index(\.exe)?$/.test(a))
@@ -1601,10 +1603,10 @@ test('the panel folds to its title', async ($, on) => {
   await ui.unmount()
 })
 
-test('a question whose options were not loaded says so, and can still be answered in words', async ($, on) => {
+test('a question whose options are not loaded yet says so, and can still be answered in words', async ($, on) => {
   const compact = mkq(1, { detail: 'compact', options: [] })
   const { ui, w } = await pane($, on, [withQs(PROGRAM, [compact])])
-  expect(await allText(ui)).toContain('The options load once the answers so far are sent.')
+  expect(await allText(ui)).toContain('Loading the options…')
   expect(await allText(ui)).toContain('Choose an option first')
   await ui.input({ key: 'app/build:Q1:own', text: 'my words' })
   await ui.press({ key: 'send:app/build' })
@@ -1860,4 +1862,84 @@ test('mobile draws the questions and takes picks; typed answers need an Input it
   await ui.press({ key: 'send:app/build' })
   expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Change', 'Q2', 'Keep'])
   await ui.unmount()
+})
+
+// -- Hold on and the full window of a long list ---------------------------------------------------------
+
+test('Hold on closes every list of options, is never preselected, and sends the answer "Hold on"', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), critical(2)])])
+  expect(await buttonText(ui, 'app/build:Q1:hold')).toBe('○ Hold on')
+  expect(await buttonText(ui, 'app/build:Q1:o0')).toMatch(/^● Keep/)
+  const keys = (await buttons(ui)).filter(k => k.startsWith('app/build:Q1:'))
+  expect(keys).toEqual(['app/build:Q1:o0', 'app/build:Q1:o1', 'app/build:Q1:hold'])
+  expect(await allText(ui)).toContain('Pause this question; nothing changes until you come back to it.')
+  await ui.press({ key: 'app/build:Q1:hold' })
+  expect(await buttonText(ui, 'app/build:Q1:hold')).toBe('● Hold on')
+  expect(await buttonText(ui, 'app/build:Q1:o0')).toBe('○ Keep · Recommended')
+  await ui.press({ key: 'next:app/build' })
+  // The critical question has Hold on too, and nothing chosen.
+  expect(await buttonText(ui, 'app/build:Q2:hold')).toBe('○ Hold on')
+  expect(await allText(ui)).toContain('Choose an option first')
+  await ui.press({ key: 'app/build:Q2:o0' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Hold on', 'Q2', 'Delete'])
+  await ui.unmount()
+})
+
+test('Accept and auto-answer never take Hold on', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  await ui.press({ key: 'accept:app/build' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Keep', 'Q2', 'Keep'])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-auto' })
+  expect(JSON.stringify(w.answers)).not.toContain('Hold on')
+  await ui.unmount()
+})
+
+test('a question that already has a Hold on option keeps its own, with no second row', async ($, on) => {
+  const own = mkq(1, { options: [qopt('Do it', 'Does it.', true), qopt('Hold on', 'Wait for the owner.')] })
+  const { ui } = await pane($, on, [withQs(PROGRAM, [own])])
+  expect((await buttons(ui)).filter(k => k.endsWith(':hold'))).toEqual([])
+  expect(await buttonText(ui, 'app/build:Q1:o1')).toBe('○ Hold on')
+  expect(await allText(ui)).toContain('Wait for the owner.')
+  expect(needsHoldRow(own)).toBe(false)
+  await ui.unmount()
+})
+
+test('the options of a question past the first full ones are fetched with --question-skip', async ($, on) => {
+  const full = (n: number) => mkq(n)
+  const tail = (n: number) => mkq(n, { detail: 'minimal', options: [], text: `Clipped ${n}`, topic: null })
+  const base = [full(1), tail(2), tail(3), tail(4)]
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, base)])
+  // The next question lacks its options, so the first poll already asked: the window from index 1 on (orch had no answer yet).
+  expect(w.groupRuns).toHaveLength(1)
+  w.groups[UNG] = skip => output({ ...withQs(PROGRAM, base), questions: { ...qblock(base), open: base.map((q, i) => (i < skip ? tail(i + 1) : mkq(i + 1, { text: `Whole text ${i + 1}` }))) } })
+  await ui.press({ key: 'next:app/build' })
+  expect(w.groupRuns[1]).toEqual([ORCH, 'status', '--json', '--cwd', '/proj', '--question-group', UNG, '--question-skip', '1'])
+  expect(w.groupRuns[0]).toEqual(w.groupRuns[1])
+  expect(await allText(ui)).toContain('Whole text 2')
+  expect(await buttonText(ui, 'app/build:Q2:o0')).toMatch(/^● Keep/)
+  expect(await allText(ui)).not.toContain('Loading the options…')
+  // Q3 and Q4 came in the same window: no second fetch for them.
+  await ui.press({ key: 'next:app/build' })
+  await ui.press({ key: 'next:app/build' })
+  expect(await buttonText(ui, 'app/build:Q4:o0')).toMatch(/^● Keep/)
+  expect(w.groupRuns).toHaveLength(2)
+  await ui.unmount()
+})
+
+test('skipFor starts the window at the first of the open and the next question that lacks options', () => {
+  const full = (n: number) => mkq(n)
+  const tail = (n: number) => mkq(n, { detail: 'compact', options: [] })
+  const list = [full(1), full(2), tail(3), tail(4)]
+  const order = ['Q1', 'Q2', 'Q3', 'Q4']
+  expect(skipFor(list, order, undefined, 'Q1')).toBeNull()
+  expect(skipFor(list, order, undefined, 'Q2')).toBe(2)
+  expect(skipFor(list, order, undefined, 'Q3')).toBe(2)
+  expect(skipFor(list, order, undefined, 'Q4')).toBe(3)
+  expect(skipFor(list, order, undefined, null)).toBeNull()
+  const full2 = { 'app/build\nQ3': mkq(3) }
+  const t = { id: 'app/build', questions: qblock(list) } as unknown as StatusTask
+  expect(openListOf(t, null, {}, full2).map(q => q.detail)).toEqual(['full', 'full', 'full', 'compact'])
 })
