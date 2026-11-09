@@ -7,7 +7,7 @@ import {
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
   HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
-  historyRows, isCritical, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
+  historyRows, isChosen, isCritical, isMulti, togglePick, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
   recommendedOf, skipFor, staleQuestion, UNGROUPED, HOLD_LABEL, HOLD_NOTE,
   COMPACT_SEND_NOTE, COMPACT_TOOL, COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
 } from './lib'
@@ -741,9 +741,9 @@ async function groupNow($: EngineInterface, taskId: string): Promise<string | nu
   return t?.questions ? (await viewNow($, t)).label : null
 }
 
-async function chooseOption($: EngineInterface, taskId: string, qid: string, label: string) {
+async function chooseOption($: EngineInterface, taskId: string, qid: string, label: string, multi = false) {
   const group = await groupNow($, taskId)
-  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: label, custom: null, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
+  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: multi ? togglePick(draftOf(all, taskId, qid)?.pick, label) : label, custom: null, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
 }
 
 async function typeAnswer($: EngineInterface, taskId: string, qid: string, text: string) {
@@ -1285,13 +1285,14 @@ export const register: Register = on => {
 
       const label = (q: StatusQuestion) => clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 4)
       const optionRows = (q: StatusQuestion) => {
-        const picked = pickedLabel(q, v.mine[q.id])
+        const multi = isMulti(q)
+        const mark = (chosen: boolean) => (multi ? (chosen ? '☑ ' : '☐ ') : (chosen ? '● ' : '○ '))
         return q.options.map((o, i) => {
-          const selected = picked === o.label
+          const selected = isChosen(q, v.mine[q.id], o.label)
           return (
             <Box flexDirection="column" marginTop={1}>
-              <Button key={`${t.id}:${q.id}:o${i}`} plain onPress={() => chooseOption($, t.id, q.id, o.label)}>
-                <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
+              <Button key={`${t.id}:${q.id}:o${i}`} plain onPress={() => chooseOption($, t.id, q.id, o.label, multi)}>
+                <Text color={selected ? 'suggestion' : undefined}>{mark(selected)}</Text>
                 <Text bold={selected ? true : undefined}>{o.label}</Text>
                 {o.recommended ? <Text dimColor> · Recommended</Text> : null}
               </Button>
@@ -1306,7 +1307,7 @@ export const register: Register = on => {
         const selected = pickedLabel(q, v.mine[q.id]) === HOLD_LABEL
         return (
           <Box flexDirection="column" marginTop={1}>
-            <Button key={`${t.id}:${q.id}:hold`} plain onPress={() => chooseOption($, t.id, q.id, HOLD_LABEL)}>
+            <Button key={`${t.id}:${q.id}:hold`} plain onPress={() => chooseOption($, t.id, q.id, HOLD_LABEL, isMulti(q))}>
               <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
               <Text bold={selected ? true : undefined}>{HOLD_LABEL}</Text>
             </Button>
@@ -1326,9 +1327,10 @@ export const register: Register = on => {
           <Box flexDirection="column" paddingLeft={2} marginTop={1}>
             <Text>{q.text}</Text>
             <Text color={critical ? 'warning' : undefined} dimColor={critical ? undefined : true}>{metaText(q)}</Text>
+            {isMulti(q) ? <Text dimColor>Pick one or more.</Text> : null}
             {hasOptions(q) ? optionRows(q) : <Box marginTop={1}><Text dimColor>Loading the options…</Text></Box>}
             {needsHoldRow(q) ? holdRow(q) : null}
-            {Input ? (
+            {Input && !isMulti(q) ? (
               <Box marginTop={1}>
                 <Input key={`${t.id}:${q.id}:own`} placeholder="Or type your own answer…" submitLabel="use"
                   value={d?.custom ?? undefined} onSubmit={value => typeAnswer($, t.id, q.id, value)} />
