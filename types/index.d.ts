@@ -44,8 +44,9 @@ export type StatusQuestion = {
   options: StatusOption[]
   answer: string | null
   answered: string | null
-  // `full`, or `compact` / `minimal` once the list's byte budget is spent: those two carry no options.
-  detail?: 'full' | 'compact' | 'minimal'
+  // `full`, or `compact` / `minimal` once the list's byte budget is spent: those two carry no options. An answered
+  // question past the newest few of the history is `history`: no options, but its answer, time and topic.
+  detail?: 'full' | 'compact' | 'minimal' | 'history'
 }
 
 export type StatusQuestions = {
