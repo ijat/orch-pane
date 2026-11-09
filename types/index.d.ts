@@ -38,6 +38,8 @@ export type StatusQuestion = {
   topic: string | null
   group: string | null
   reversible: string | null
+  // Several options may be picked; the answer is the chosen labels joined by `|`. Absent in an orch from before multi-select.
+  multi?: boolean
   blocks: string | null
   asked_by: string | null
   asked: string | null
