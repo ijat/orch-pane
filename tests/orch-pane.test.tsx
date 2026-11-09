@@ -75,6 +75,7 @@ type World = {
   answers: string[][]; answered: Ran; onAnswers: (argv: string[]) => void
   // `orch status --question-group <label>`: the stdout to give by label, and the runs.
   groups: Record<string, string | ((skip: number) => string)>; groupRuns: string[][]
+  toasts: string[]
   wakes: string[]; notes: string[]
   // The tools registered, `session.compact` calls (their instructions), how many of them fail first, and the order of effects.
   tools: string[]; compacts: (string | undefined)[]; compactFails: number; order: string[]
@@ -103,7 +104,7 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
                env: Record<string, string> = { HOME: '/home/u' }): World {
   const w: World = {
     runs: [], indexRuns: [], opens: 0, paneOpen: true, placed: true, result, index: INDEX_RAN,
-    answers: [], answered: { exitCode: 0, stdout: 'Q1 answered', stderr: '' }, onAnswers: () => {}, groups: {}, groupRuns: [], wakes: [], notes: [], tools: [], compacts: [], compactFails: 0, order: [],
+    answers: [], answered: { exitCode: 0, stdout: 'Q1 answered', stderr: '' }, onAnswers: () => {}, groups: {}, groupRuns: [], toasts: [], wakes: [], notes: [], tools: [], compacts: [], compactFails: 0, order: [],
   }
   mock.env(on, env)
   on('session.cwd', () => ({ value: '/proj' }))
@@ -155,7 +156,7 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
     w.notes.push(e.text)
     return { value: { isSent: true as const, channel: 'kitty' as const } }
   })
-  on('ui.toast', () => ({ value: undefined }))
+  on('ui.toast', (_, e) => { w.toasts.push(JSON.stringify(e)); return { value: undefined } })
   on('tool.register', (_, e) => {
     w.tools.push(e.name)
     return { value: { tool: `mcp__orch-pane__${e.name}` } }
@@ -1611,6 +1612,24 @@ test('questions of another task are answered against that task', async ($, on) =
   await ui.unmount()
 })
 
+test('a Send for another folder\'s task records the answers, says so, and neither wakes nor compacts this session', async ($, on) => {
+  const other = withQs({ ...OTHER, in_cwd: false }, [mkq(1)])
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, []), other])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-compact-send' })
+  await ui.press({ key: 'scope' })
+  await ui.press({ key: 'task:other/fix' })
+  expect(await allText(ui)).not.toContain('wakes the agent')
+  expect(await allText(ui)).toContain("saved for that task's session")
+  await ui.press({ key: 'send:other/fix' })
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'other/fix', '--', 'Q1', 'Keep']])
+  expect(w.wakes).toEqual([])
+  expect(w.compacts).toEqual([])
+  expect(w.toasts.join(' ')).toContain('next checkpoint')
+  expect(w.toasts.join(' ')).not.toContain('woken')
+  await ui.unmount()
+})
+
 test('the panel folds to its title', async ($, on) => {
   const { ui } = await pane($, on, [withQs(PROGRAM, [mkq(1)])])
   await ui.press({ key: 'needs-fold:app/build' })
@@ -1823,6 +1842,42 @@ test('a new question in another group does not move the open question on a poll'
   w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [open[0]!])), stderr: '' }
   await clock.advance(8000)
   expect(await allText(ui)).toContain('Should item 9 change?')
+  await ui.unmount()
+})
+
+test('a group that emptied and refills on a poll does not take the open question back', async ($, on) => {
+  const a = [mkq(1, { group: 'Area A' })]
+  const b = [mkq(3, { group: 'Area B' }), mkq(4, { group: 'Area B' })]
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, [...a, ...b])])
+  expect(await allText(ui)).toContain('Should item 1 change?')
+  // Area A is answered elsewhere: the data's first group, Area B, takes over, and the person moves to Q4.
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, b)), stderr: '' }
+  await clock.advance(8000)
+  await ui.press({ key: 'row:app/build:Q4' })
+  expect(await allText(ui)).toContain('Should item 4 change?')
+  // An agent parks a follow-up in Area A, and it sorts first.
+  const open = [mkq(9, { group: 'Area A', blocks: 'all' }), ...b]
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, open)), stderr: '' }
+  w.groups['Area B'] = output({ ...withQs(PROGRAM, open), questions: { ...qblock(open), open_group: 'Area B', open: b } })
+  await clock.advance(8000)
+  expect(await allText(ui)).toContain('Should item 4 change?')
+  expect(await allText(ui)).not.toContain('Should item 9 change?')
+  await ui.unmount()
+})
+
+test('a group that cannot be loaded on a poll keeps the open question for when it can', async ($, on) => {
+  const a = [mkq(1, { group: 'Area A' }), mkq(2, { group: 'Area A' })]
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, a)])
+  await ui.press({ key: 'row:app/build:Q2' })
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  const open = [mkq(9, { group: 'Area B', blocks: 'all' }), ...a]
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, open)), stderr: '' }
+  w.groups['Area A'] = 'not json'
+  await clock.advance(8000)
+  w.groups['Area A'] = output({ ...withQs(PROGRAM, open), questions: { ...qblock(open), open_group: 'Area A', open: a } })
+  await clock.advance(8000)
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  expect(await ui.find({ type: 'Button', key: 'row:app/build:Q1' })).toBeDefined()   // Q1 waits; Q2 is the open one
   await ui.unmount()
 })
 
