@@ -1,9 +1,9 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask } from '../types'
+import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask, Tab } from '../types'
 import {
-  GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
+  GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, countTail, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
 } from './lib'
@@ -29,7 +29,13 @@ const frame = atom({ plugin: 'orch-pane', key: 'frame' } as const, 0)
 const plain = atom({ plugin: 'orch-pane', key: 'plain' } as const, {} as Record<string, PlainEntry>)
 const IDLE: AskState = { state: 'idle' }
 const ask = atom({ plugin: 'orch-pane', key: 'ask' } as const, IDLE)
+// The folded bottom panel's open tab (null: all folded), and the Advanced option "AI summaries" (also kept in $.store).
+const tab = atom({ plugin: 'orch-pane', key: 'tab' } as const, null as Tab | null)
+const ai = atom({ plugin: 'orch-pane', key: 'ai' } as const, true)
+const AI_KEY = 'opt:ai'
 
+const AGENTS_SHOWN = 3
+const HISTORY_SHOWN = 10
 const SPIN_MS = 120
 const FRAME_WRAP = 3600
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -283,6 +289,26 @@ async function askHaiku($: EngineInterface, question: string, tasks: readonly St
   await update($, ask, () => settled)
 }
 
+// The AI-summaries option outlives the session: the store holds it, the atom serves the drawing.
+async function loadAi($: EngineInterface) {
+  try {
+    const stored = await $.store.get(AI_KEY)
+    if (typeof stored === 'boolean') await update($, ai, () => stored)
+  } catch {
+    // The default (on) stays.
+  }
+}
+
+async function toggleAi($: EngineInterface) {
+  const next = (await read($, ai)) === false
+  await update($, ai, () => next)
+  try {
+    await $.store.set(AI_KEY, next)
+  } catch {
+    // This session keeps it; the next one starts from the default.
+  }
+}
+
 async function clearAsk($: EngineInterface) {
   askStop?.abort()
   askStop = null
@@ -305,14 +331,13 @@ type Bar = { label: string; percent: number; tail: string; kind: 'steps' | 'over
 
 function bars(t: StatusTask): Bar[] {
   const out: Bar[] = []
-  const { done, total, percent } = t.steps
-  if (total !== null && done !== null && percent !== null) {
-    const label = t.program && t.milestone_no !== null ? `M${t.milestone_no} steps` : 'Steps'
-    out.push({ label, percent, tail: stepsTail(percent, done, total), kind: 'steps', estimate: false })
-  }
   const p = t.overall.percent
   if (p !== null) {
     out.push({ label: 'Overall', percent: p, tail: overallTail(p, t.overall.estimate), kind: 'overall', estimate: t.overall.estimate })
+  }
+  const { done, total, percent } = t.steps
+  if (total !== null && done !== null && percent !== null) {
+    out.push({ label: 'Steps', percent, tail: stepsTail(percent, done, total), kind: 'steps', estimate: false })
   }
   return out
 }
@@ -339,6 +364,7 @@ export const register: Register = on => {
     })
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
     $.clock.every(SPIN_MS, () => void spinIfRunning($))
+    void loadAi($)
     void (async () => {
       const data = await fetchStatus($)
       if (data?.tasks.some(t => t.in_cwd) && !(await read($, dismissed))) {
@@ -377,18 +403,22 @@ export const register: Register = on => {
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const elements = $.ui.resolve(e)
     const { Box, Text, Button } = elements
-    // Mobile draws no Input (its table has none); the Ask section is left out there.
+    // Mobile draws no Input (its table has none); the Ask tab says so there.
     const Input = e.surface !== 'mobile' && 'Input' in elements ? elements.Input : undefined
     const plainMap = await read($, plain)
     const asked = await read($, ask)
     const snap = await read($, snapshot)
     const all = await read($, showAll)
     const open = await read($, expanded)
+    // A stored value of another shape reads as the default: all folded, AI summaries on.
+    const storedTab = await read($, tab)
+    const openTab = storedTab === 'history' || storedTab === 'ask' || storedTab === 'more' ? storedTab : null
+    const aiOn = (await read($, ai)) !== false
     const tick = await read($, frame)
     const spin = SPINNER[tick % SPINNER.length]
     const now = snap.fetchedAt
     const width = Math.max(16, e.props.bodyColumns)
-    // Task content sits 2 in and a section's rows 2 more; an item's summary is 2 in from its row.
+    // A panel's border and padding take 4 columns; an item's summary sits 2 in from its row.
     const room = width - 4
     const everyTask = snap.data?.tasks ?? []
     const tasks = sortByAttention(everyTask.filter(t => all || t.in_cwd), now)
@@ -396,6 +426,17 @@ export const register: Register = on => {
     const isExpanded = (key: string, fallback = false) => open[key] ?? fallback
     const toggle = (key: string, fallback = false) => () =>
       update($, expanded, m => ({ ...m, [key]: !((m ?? {})[key] ?? fallback) }))
+
+    const panel = (children: RenderChildren, color?: 'warning') => (
+      <Box flexDirection="column" borderStyle="round" borderColor={color} borderDimColor={color ? undefined : true} paddingX={1} marginTop={1}>
+        {children}
+      </Box>
+    )
+    const blank = <Text> </Text>
+    const head = (left: RenderChildren, right: RenderChildren) => (
+      <Box flexDirection="row" justifyContent="space-between">{left}{right}</Box>
+    )
+    const subhead = (title: string) => <Text bold>{title}</Text>
 
     const mdRow = (l: MdLine) => (
       <Text>
@@ -408,11 +449,13 @@ export const register: Register = on => {
 
     // An expanded summary: Haiku's plain text when it has one (a `raw` button shows the source), else the
     // source's markdown-lite with the summary's state under it. The source is reachable in every state.
+    // With AI summaries off it is always the source, with no summary button.
     const explained = (itemKey: string, input: string, source: string, cols: number) => {
+      const sourceRows = mdLite(source, cols).map(mdRow)
+      if (!aiOn) return sourceRows
       const entry = plainMap[textKey(input)]
       const rawKey = `raw:${itemKey}`
       const showRaw = isExpanded(rawKey)
-      const sourceRows = mdLite(source, cols).map(mdRow)
       const flip = (label: string) => (
         <Button key={rawKey} plain onPress={toggle(rawKey)}>
           <Text dimColor>{label}</Text>
@@ -436,41 +479,22 @@ export const register: Register = on => {
     const summaryBlock = (itemKey: string, input: string, text: string | null, cols: number) =>
       text ? <Box flexDirection="column" paddingLeft={2}>{explained(itemKey, input, text, cols - 2)}</Box> : null
 
-    // Opening an item with a summary also asks for its plain-language summary.
+    // Opening an item with a summary also asks for its plain-language summary, unless AI summaries are off.
     const expandExplained = (key: string, input: string | null) => async () => {
       const opening = !isExpanded(key)
       await toggle(key)()
-      if (opening && input) await requestPlain($, input)
+      if (opening && input && aiOn) await requestPlain($, input)
     }
 
-    const section = (title: string, rows: RenderChildren[], extra?: string) => {
-      const shown = rows.filter(Boolean)
-      if (shown.length === 0) return null
-      return (
-        <Box flexDirection="column" marginTop={1}>
-          <Text>
-            <Text bold color="suggestion">{title}</Text>
-            {extra ? <Text dimColor>{`  ${extra}`}</Text> : null}
-          </Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {shown}
-          </Box>
-        </Box>
-      )
-    }
-
-    const barRow = (t: StatusTask, b: Bar, layout: { labelW: number; barW: number }) => {
+    const barRow = (b: Bar, layout: { labelW: number; barW: number }) => {
       const filled = barCells(b.percent, layout.barW)
-      const cells =
-        b.kind === 'overall'
-          ? [<Text color="claude">{'█'.repeat(filled)}</Text>]
-          : [<Text color="success">{'█'.repeat(filled)}</Text>]
+      const color = b.kind === 'overall' ? 'claude' : 'success'
       return (
         <Text>
-          <Text bold>{b.label.padEnd(layout.labelW)}</Text>
-          {filled > 0 ? cells : null}
+          {b.label.padEnd(layout.labelW)}
+          {filled > 0 ? <Text color={color}>{'█'.repeat(filled)}</Text> : null}
           <Text dimColor>{'░'.repeat(layout.barW - filled)}</Text>
-          <Text color={b.estimate ? undefined : b.kind === 'overall' ? 'claude' : 'success'} dimColor={b.estimate}>
+          <Text color={b.estimate ? undefined : color} dimColor={b.estimate}>
             {`  ${b.tail}`}
           </Text>
         </Text>
@@ -514,60 +538,62 @@ export const register: Register = on => {
       )
     }
 
-    // A list folded around its current item. Every fold row and the `▴ fold` row flip one switch; the first
-    // fold row carries the switch's own key, the others that key plus their first index (keys stay unique).
+    // A list with its done runs and its later items folded. `▴ fold done` sits above its run, `▴ fold` below
+    // its run. One switch per kind: the first fold row carries the switch's own key, any other that key plus
+    // its first index (keys stay unique).
     function foldedList<T>(t: StatusTask, list: 'ms' | 'steps', items: T[], stateOf: (x: T) => ItemState,
       idOf: (x: T) => string, row: (x: T) => RenderChildren): RenderChildren[] {
-      const key = `fold:${t.id}:${list}`
-      const rows = fold(items, stateOf)
-      if (!rows.some(r => r.kind !== 'item')) return items.map(row)
-      if (isExpanded(key)) {
-        return [...items.map(row), <Button key={key} plain onPress={toggle(key)}><Text dimColor>▴ fold</Text></Button>]
+      const doneKey = `fold:${t.id}:${list}:done`
+      const laterKey = `fold:${t.id}:${list}:later`
+      const used = new Set<string>()
+      const keyFor = (base: string, from: number) => {
+        if (used.has(base)) return `${base}:${from}`
+        used.add(base)
+        return base
       }
-      let first = true
-      return rows.map(r => {
+      return fold(items, stateOf).flatMap((r): RenderChildren[] => {
         if (r.kind === 'item') {
           const item = items[r.index]
-          return item === undefined ? null : row(item)
+          return item === undefined ? [] : [row(item)]
         }
-        const k = first ? key : `${key}:${r.from}`
-        first = false
+        const run = items.slice(r.from, r.to + 1)
         const [a, b] = [items[r.from], items[r.to]]
         if (r.kind === 'done') {
+          const k = keyFor(doneKey, r.from)
+          if (isExpanded(doneKey)) {
+            return [<Button key={k} plain onPress={toggle(doneKey)}><Text dimColor>▴ fold done</Text></Button>, ...run.map(row)]
+          }
           const range = a === undefined || b === undefined ? '' : `${idOf(a)}–${idOf(b)} `
-          return (
-            <Button key={k} plain onPress={toggle(key)}>
-              <Text color="success">{`✓ ${range}done`}</Text>
-            </Button>
-          )
+          return [<Button key={k} plain onPress={toggle(doneKey)}><Text color="success">{`✓ ${range}done`}</Text></Button>]
         }
-        return (
-          <Button key={k} plain onPress={toggle(key)}>
-            <Text dimColor>{`· ${r.to - r.from + 1} more`}</Text>
-          </Button>
-        )
+        const k = keyFor(laterKey, r.from)
+        if (isExpanded(laterKey)) {
+          return [...run.map(row), <Button key={k} plain onPress={toggle(laterKey)}><Text dimColor>▴ fold</Text></Button>]
+        }
+        return [<Button key={k} plain onPress={toggle(laterKey)}><Text dimColor>{`· ${run.length} more`}</Text></Button>]
       })
     }
 
-    const runningRows = (t: StatusTask, barW: number) => {
-      const spawn = t.running.last_spawn
-      const rows = t.running.roles.map(r => {
+    // One block per running role: the name and tier, the agent's own bar when it reports one, and its facts.
+    const agentBlocks = (t: StatusTask, barW: number) =>
+      t.running.roles.map((r, i) => {
         const mine = spawnOf(t, r.role)
         const since = mine && !mine.returned ? elapsed(mine.ts, now) : null
         // The spawn's own step list is current; a status file's `step` may be an older one.
         const last = r.step && !mine?.steps?.length ? `last: ${r.step}` : null
-        const tail = [since ? `running ${since}` : null, last].filter(Boolean)
+        const tail = [mine?.steps?.length ? `steps ${mine.steps.join(',')}` : null, since ? `running ${since}` : null, last].filter(Boolean)
         const pct = agentPct(r)
         const pctFilled = pct === null ? 0 : pct === 0 ? barW : barCells(pct, barW)
         const pctPalette = pct === 0 ? GREY : agentPalette(r.role)
         return (
-          <Box flexDirection="column">
-            <Text>
-              <Text color="claude">{`${spin} `}</Text>
-              <Text bold color="claude">{r.role ?? '?'}</Text>
-              {mine?.tier ? <Text color="permission">{`  ${mine.tier}`}</Text> : null}
-              {mine?.steps?.length ? <Text color="suggestion">{`  steps ${mine.steps.join(',')}`}</Text> : null}
-            </Text>
+          <Box flexDirection="column" marginTop={i === 0 ? 0 : 1}>
+            {head(
+              <Text>
+                <Text color="claude">{`${spin} `}</Text>
+                <Text bold color="claude">{r.role ?? '?'}</Text>
+              </Text>,
+              mine?.tier ? <Text color="permission">{mine.tier}</Text> : null,
+            )}
             {pct !== null && (
               <Text>
                 {'  '}
@@ -582,7 +608,32 @@ export const register: Register = on => {
           </Box>
         )
       })
-      if (rows.length === 0 && spawn) {
+
+    // The Agents block: three agents, then a fold row; or the last spawn when no role runs.
+    const agentsRows = (t: StatusTask, barW: number) => {
+      const spawn = t.running.last_spawn
+      const blocks = agentBlocks(t, barW)
+      const foldKey = `agents:${t.id}`
+      const isOpenAgents = isExpanded(foldKey)
+      const act = lastActivity(t)
+      const when = act ? ago(act.at, now) : null
+      const actText = act ? [act.who, act.text].filter(Boolean).join(' ') + (when ? ` · ${when}` : '') : null
+      const idle = now !== null && isStale(t, now) ? idleMinutes(t, now) : null
+      const running = blocks.length + (blocks.length === 0 && spawn && !spawn.returned ? 1 : 0)
+      const rows: RenderChildren[] = [
+        head(<Text bold>Agents</Text>, running > 0 ? <Text dimColor>{`${running} running`}</Text> : null),
+        ...(isOpenAgents ? blocks : blocks.slice(0, AGENTS_SHOWN)),
+      ]
+      if (blocks.length > AGENTS_SHOWN) {
+        rows.push(
+          <Box marginTop={1}>
+            <Button key={`agents-fold:${t.id}`} plain onPress={toggle(foldKey)}>
+              <Text dimColor>{isOpenAgents ? '▴ fold' : `· ${blocks.length - AGENTS_SHOWN} more`}</Text>
+            </Button>
+          </Box>,
+        )
+      }
+      if (blocks.length === 0 && spawn) {
         const parts = [`last spawn: ${spawn.role ?? '?'}`, spawn.tier, spawn.steps?.length ? `steps ${spawn.steps.join(',')}` : null,
           spawn.returned ? 'returned' : `running ${elapsed(spawn.ts, now) ?? ''}`.trim()]
         rows.push(
@@ -592,20 +643,11 @@ export const register: Register = on => {
           </Text>,
         )
       }
+      if (idle !== null && now !== null) rows.push(<Text color="warning">{`idle ${minutesText(idle, now)} · nothing running`}</Text>)
+      if (blocks.length === 0 && !spawn && idle === null) rows.push(<Text dimColor>nothing running</Text>)
+      if (actText) rows.push(<Box marginTop={1}><Text dimColor>{clip(actText, room)}</Text></Box>)
+      if (t.error) rows.push(<Text color="error">{t.error}</Text>)
       return rows
-    }
-
-    const nowRows = (t: StatusTask, barW: number) => {
-      const act = lastActivity(t)
-      const when = act ? ago(act.at, now) : null
-      const actText = act ? [act.who, act.text].filter(Boolean).join(' ') + (when ? ` · ${when}` : '') : null
-      const idle = now !== null && isStale(t, now) ? idleMinutes(t, now) : null
-      return [
-        ...runningRows(t, barW),
-        actText ? <Text dimColor>{clip(actText, room)}</Text> : null,
-        idle !== null && now !== null ? <Text color="warning">{`idle ${minutesText(idle, now)} · nothing running`}</Text> : null,
-        t.error ? <Text color="error">{t.error}</Text> : null,
-      ]
     }
 
     // Folded: one clipped line. Open: the plain summary or the summary's markdown-lite lines under it.
@@ -624,21 +666,151 @@ export const register: Register = on => {
       ]
     }
 
+    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+
+    // The status card: name and state, goal, facts, the Overall and Steps bars, and the Agents.
+    const card = (t: StatusTask, key: string) => {
+      const color = stateColor(t.state)
+      const name = all ? t.id : (t.slug ?? t.id)
+      const questions = t.questions_open ?? 0
+      const badge = questions > 0 ? `? ${plural(questions, 'question')}  ` : ''
+      const state = t.state_words ?? t.state
+      const facts = [placeText(t), t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
+      const progress = bars(t)
+      const layout = barLayout(room, progress)
+      return panel([
+        head(
+          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+            <Text color={color}>▾</Text>{' '}
+            <Text bold>{clip(name, Math.max(8, room - badge.length - state.length - 4))}</Text>
+          </Button>,
+          <Text>
+            {badge ? <Text color="warning">{badge}</Text> : null}
+            <Text color={color}>{state}</Text>
+          </Text>,
+        ),
+        blank,
+        ...goalRows(t),
+        facts ? <Text color="subtle">{clip(facts, room)}</Text> : null,
+        progress.length > 0 ? blank : null,
+        ...progress.map(b => barRow(b, layout)),
+        blank,
+        ...agentsRows(t, layout.barW),
+      ])
+    }
+
+    // Milestones and the current milestone's steps, folded around the current item.
+    const workPanel = (t: StatusTask) => {
+      const milestones = t.milestones?.items ?? []
+      const steps = t.steps.items
+      const count = (items: { done: boolean }[]) => countTail(items.filter(i => i.done).length, items.length)
+      const blocks: RenderChildren[][] = []
+      if (milestones.length > 0) {
+        blocks.push([
+          head(<Text bold>Milestones</Text>, <Text dimColor>{count(milestones.map(m => ({ done: m.state === 'done' })))}</Text>),
+          ...foldedList(t, 'ms', milestones, m => m.state, m => `M${m.n}`, m => milestoneRow(t, m)),
+        ])
+      }
+      if (steps.length > 0) {
+        blocks.push([
+          head(<Text bold>{t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps'}</Text>, <Text dimColor>{count(steps)}</Text>),
+          ...foldedList(t, 'steps', steps, stepState, s => s.id, s => stepRow(t, s)),
+        ])
+      }
+      return blocks.length === 0 ? null : panel(blocks.flatMap((b, i) => (i === 0 ? b : [blank, ...b])))
+    }
+
+    const taskBlock = (t: StatusTask, index: number) => {
+      const key = `task:${t.id}`
+      if (taskOpen(t)) return <Box flexDirection="column">{card(t, key)}{workPanel(t)}</Box>
+      // Folded tasks stack tight.
+      const prev = tasks[index - 1]
+      const gap = index === 0 || (prev && taskOpen(prev)) ? 1 : 0
+      const color = stateColor(t.state)
+      const name = all ? t.id : (t.slug ?? t.id)
+      const questions = t.questions_open ?? 0
+      return (
+        <Box flexDirection="column" marginTop={gap}>
+          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+            <Text color={color}>▸</Text>{' '}
+            <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
+            {'  '}
+            <Text color={color}>{t.state_words ?? t.state}</Text>
+            {questions > 0 ? <Text color="warning">{`  ? ${plural(questions, 'question')}`}</Text> : null}
+            <Text dimColor>{percentText(t) ? `  ${percentText(t)}` : ''}</Text>
+          </Button>
+        </Box>
+      )
+    }
+
+    const empty = snap.data && tasks.length === 0
+      ? all ? 'No active tasks.' : 'No orchestration task for this folder.'
+      : null
+    const staleSince = snap.error && snap.data ? (snap.okAt ?? snap.fetchedAt) : null
+
+    // The tabs act on the shown tasks as a whole; History reads the first open one.
+    const primary = tasks.find(taskOpen) ?? tasks[0]
+
+    const historyTab = () => {
+      const answered = (primary?.questions?.history ?? []).filter(q => q.status === 'answered' || q.status === 'assumed')
+      if (answered.length === 0) return [<Text dimColor>No answered questions yet.</Text>]
+      return answered.slice(0, HISTORY_SHOWN).map(q => {
+        const key = `hist:${q.id}`
+        const auto = q.status === 'assumed'
+        return (
+          <Box flexDirection="column">
+            {head(
+              <Button key={key} plain onPress={toggle(key)}>
+                <Text color="subtle">{isExpanded(key) ? '▾ ' : '▸ '}</Text>
+                {clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 14)}
+              </Button>,
+              auto ? <Text color="permission">◆ Auto</Text> : <Text color="success">✓ Answered</Text>,
+            )}
+            {isExpanded(key) ? (
+              <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
+                {mdLite(q.text, room - 2).map(mdRow)}
+                <Text color="suggestion">{`→ ${q.answer ?? ''}`}</Text>
+                <Text dimColor>{q.answered ?? ''}</Text>
+              </Box>
+            ) : null}
+          </Box>
+        )
+      })
+    }
+
+    const askTab = () => {
+      if (!Input) return [<Text dimColor>Ask is not available here.</Text>]
+      const rows: RenderChildren[] = [
+        <Input key="ask" placeholder="Ask about these tasks…" submitLabel="ask" onSubmit={value => askHaiku($, value, tasks)} />,
+      ]
+      if (asked.state !== 'idle') {
+        rows.push(<Text dimColor>{clip(`Q: ${asked.question}`, room)}</Text>)
+        if (asked.state === 'busy') rows.push(<Text color="claude">{`${spin} thinking…`}</Text>)
+        if (asked.state === 'done') rows.push(...mdLite(asked.answer, room).map(mdRow))
+        if (asked.state === 'error') rows.push(<Text color="error">{`no answer: ${asked.reason}`}</Text>)
+        rows.push(
+          <Button key="ask-clear" plain onPress={() => clearAsk($)}>
+            <Text dimColor>clear</Text>
+          </Button>,
+        )
+      }
+      return rows
+    }
+
     // The code index of this folder, folded to one line (state, size, when it was revised); open, its details.
-    const indexRows = (t: StatusTask) => {
-      if (t.in_cwd !== true) return []
+    const indexRows = () => {
       const ix = snap.index
       if (!ix) return snap.indexNote ? [<Text dimColor>{clip(snap.indexNote, room)}</Text>] : []
       const look = indexLook(ix)
       const isOpenIndex = isExpanded('index')
-      const head = indexHeadline(ix, now)
+      const headline = indexHeadline(ix, now)
       const rows = indexDetails(ix, now)
       const labelW = Math.max(0, ...rows.map(r => r.label.length)) + 2
       return [
-        <Button key={`index:${t.id}`} plain onPress={toggle('index')}>
+        <Button key="index" plain onPress={toggle('index')}>
           <Text color="subtle">{isOpenIndex ? '▾ ' : '▸ '}</Text>
           <Text color={look.color} bold>{look.words}</Text>
-          {head ? <Text dimColor>{clip(` · ${head}`, Math.max(8, room - 2 - look.words.length))}</Text> : null}
+          {headline ? <Text dimColor>{clip(` · ${headline}`, Math.max(8, room - 2 - look.words.length))}</Text> : null}
           {indexNeedsAnswerWarning(ix) ? <Text color="warning">{'  ⚠ stale answers'}</Text> : null}
         </Button>,
         isOpenIndex ? (
@@ -656,107 +828,55 @@ export const register: Register = on => {
       ]
     }
 
-    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+    const check = (key: string, on_: boolean, label: string, note: string | null, press: () => void) => (
+      <Box flexDirection="column" marginBottom={1}>
+        <Button key={key} plain onPress={press}>
+          <Text color={on_ ? 'success' : undefined}>{on_ ? '[x] ' : '[ ] '}</Text>{label}
+        </Button>
+        {note ? <Box paddingLeft={4}><Text dimColor>{note}</Text></Box> : null}
+      </Box>
+    )
 
-    const taskBlock = (t: StatusTask, index: number) => {
-      const key = `task:${t.id}`
-      const isOpenTask = taskOpen(t)
-      // Folded tasks stack tight; an open task gets room around it.
-      const prev = tasks[index - 1]
-      const gap = index === 0 ? 1 : isOpenTask || (prev && taskOpen(prev)) ? 2 : 0
-      const color = stateColor(t.state)
-      const facts = [t.mode, t.shape, t.milestone].filter(Boolean).join(' · ')
-      const name = all ? t.id : (t.slug ?? t.id)
-      const questions = t.questions_open ?? 0
-      const progress = bars(t)
-      const layout = barLayout(room, progress)
-      const milestones = t.milestones?.items ?? []
-      const steps = t.steps.items
-      const msDone = t.milestones?.total ? `${t.milestones.done}/${t.milestones.total} done` : undefined
-      return (
-        <Box flexDirection="column" marginTop={gap}>
-          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
-            <Text color={color}>{isOpenTask ? '▾' : '▸'}</Text>{' '}
-            <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
-            {'  '}
-            <Text color={color}>{t.state_words ?? t.state}</Text>
-            {questions > 0 ? <Text color="warning">{`  ? ${plural(questions, 'question')}`}</Text> : null}
-            <Text dimColor>{percentText(t) ? `  ${percentText(t)}` : ''}</Text>
-          </Button>
-          {isOpenTask && (
-            <Box flexDirection="column" paddingLeft={2}>
-              {placeText(t) ? (
-                <Box marginTop={1}>
-                  <Text color="suggestion">{clip(placeText(t), width - 4)}</Text>
-                </Box>
-              ) : null}
-              {facts ? <Text color="subtle">{facts}</Text> : null}
-              {section('Goal', goalRows(t))}
-              {section('Index', indexRows(t))}
-              {section('Now', nowRows(t, layout.barW))}
-              {section('Progress', progress.map(b => barRow(t, b, layout)))}
-              {milestones.length > 0
-                ? section('Milestones', foldedList(t, 'ms', milestones, m => m.state, m => `M${m.n}`, m => milestoneRow(t, m)), msDone)
-                : null}
-              {steps.length > 0
-                ? section(t.program && t.milestone_no !== null ? `Steps (M${t.milestone_no})` : 'Steps',
-                  foldedList(t, 'steps', steps, stepState, s => s.id, s => stepRow(t, s)))
-                : null}
-            </Box>
-          )}
-        </Box>
-      )
-    }
-
-    const empty = snap.data && tasks.length === 0
-      ? all ? 'No active tasks.' : 'No orchestration task for this folder.'
-      : null
-    const staleSince = snap.error && snap.data ? (snap.okAt ?? snap.fetchedAt) : null
-
-    const askRows = () => {
-      if (!Input) return null
-      const rows: RenderChildren[] = [
-        <Input key="ask" placeholder="Ask about these tasks…" submitLabel="ask" onSubmit={value => askHaiku($, value, tasks)} />,
+    const moreTab = () => {
+      const index = indexRows()
+      return [
+        ...(index.length > 0 ? [subhead('Index'), ...index, blank] : []),
+        subhead('Advanced options'),
+        blank,
+        check('opt-ai', aiOn, 'AI summaries: goal, milestones, steps', 'off shows the original text', () => toggleAi($)),
+        ...(snap.about
+          ? [
+              subhead('About'),
+              ...snap.about.map(p => (
+                <Text key={p.name}>
+                  <Text dimColor>{p.name.padEnd(11)}</Text>
+                  {p.installed
+                    ? <Text>{`v${p.version}`}{p.commit ? <Text dimColor>{`  ${p.commit}`}</Text> : null}</Text>
+                    : <Text color="warning">not installed</Text>}
+                </Text>
+              )),
+            ]
+          : []),
       ]
-      if (asked.state !== 'idle') {
-        rows.push(<Text dimColor>{clip(`Q: ${asked.question}`, width - 2)}</Text>)
-        if (asked.state === 'busy') rows.push(<Text color="claude">{`${spin} thinking…`}</Text>)
-        if (asked.state === 'done') rows.push(...mdLite(asked.answer, width - 2).map(mdRow))
-        if (asked.state === 'error') rows.push(<Text color="error">{`no answer: ${asked.reason}`}</Text>)
-        rows.push(
-          <Button key="ask-clear" plain onPress={() => clearAsk($)}>
-            <Text dimColor>clear</Text>
-          </Button>,
-        )
-      }
-      return (
-        <Box flexDirection="column" marginTop={2}>
-          <Text bold color="suggestion">Ask</Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {rows}
-          </Box>
-        </Box>
-      )
     }
 
-    const aboutRows = () => {
-      if (!snap.about) return null
-      return (
-        <Box flexDirection="column" marginTop={2}>
-          <Text bold color="suggestion">About</Text>
-          <Box flexDirection="column" paddingLeft={2}>
-            {snap.about.map(p => (
-              <Text key={p.name}>
-                <Text dimColor>{p.name.padEnd(11)}</Text>
-                {p.installed
-                  ? <Text>{`v${p.version}`}{p.commit ? <Text dimColor>{`  ${p.commit}`}</Text> : null}</Text>
-                  : <Text color="warning">not installed</Text>}
-              </Text>
-            ))}
-          </Box>
-        </Box>
-      )
-    }
+    const TABS: { id: Tab; label: string }[] = [
+      { id: 'history', label: 'History' },
+      { id: 'ask', label: 'Ask' },
+      { id: 'more', label: 'More' },
+    ]
+    const tabBar = (
+      <Box flexDirection="row" flexWrap="wrap">
+        {TABS.flatMap((t, i) => [
+          i > 0 ? <Text dimColor>{' │ '}</Text> : null,
+          <Button key={`tab:${t.id}`} plain onPress={() => update($, tab, cur => (cur === t.id ? null : t.id))}>
+            <Text bold={openTab === t.id ? true : undefined} underline={openTab === t.id ? true : undefined}
+              color={openTab === t.id ? 'suggestion' : undefined} dimColor={openTab === t.id ? undefined : true}>{t.label}</Text>
+          </Button>,
+        ])}
+      </Box>
+    )
+    const tabBody = openTab === null ? [] : [blank, ...{ history: historyTab, ask: askTab, more: moreTab }[openTab]()]
 
     return (
       <Box flexDirection="column">
@@ -768,8 +888,7 @@ export const register: Register = on => {
         {!snap.data && !snap.error && <Text dimColor>Loading…</Text>}
         {empty && <Text dimColor>{empty}</Text>}
         {tasks.map(taskBlock)}
-        {askRows()}
-        {aboutRows()}
+        {panel([tabBar, ...tabBody])}
       </Box>
     )
   })

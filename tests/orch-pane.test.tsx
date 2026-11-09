@@ -3,7 +3,7 @@ import type { On } from 'claude-code'
 import type { Engine, MockClock } from 'claude-code/testing'
 
 import {
-  agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
+  agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, countTail, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, spawnOf, sparkline, stepsTail, textKey,
 } from '../hooks/lib'
@@ -135,11 +135,12 @@ test('shows the repo task with bars, markers and the running line, on every surf
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /M2 steps/ }))?.text).toBe('M2 steps  ████████████░░░░░░░░░░░░   50%  1/2')
-    expect((await ui.find({ type: 'Text', text: /Overall/ }))?.text).toBe('Overall   ██████████░░░░░░░░░░░░░░   43%  estimate')
-    expect((await ui.find({ type: 'Text', text: /implementer/ }))?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] implementer  sonnet\/high  steps 2$/)
+    expect((await ui.find({ type: 'Text', text: /^Steps/ }))?.text).toBe('Steps    ████████████░░░░░░░░░░░░  1/2 · 50%')
+    expect((await ui.find({ type: 'Text', text: /^Overall/ }))?.text).toBe('Overall  ██████████░░░░░░░░░░░░░░   43%  estimate')
+    expect((await ui.find({ type: 'Text', text: /implementer/ }))?.text).toMatch(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] implementer$/)
+    expect((await ui.find({ type: 'Text', text: /^sonnet/ }))?.text).toBe('sonnet/high')
     // The spawn lists its steps, so the status file's older `last: 1` is left out.
-    expect((await ui.find({ type: 'Text', text: /running/ }))?.text).toBe('  running 12m')
+    expect((await ui.find({ type: 'Text', text: /^ {2}steps/ }))?.text).toBe('  steps 2 · running 12m')
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:1' }))?.text).toMatch(/^✓ M1 first/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:2' }))?.text).toMatch(/^▶ M2 second.*L/)
     expect((await ui.find({ type: 'Button', key: 'ms:app/build:3' }))?.text).toMatch(/^· M3 third/)
@@ -339,31 +340,41 @@ test('goalLine takes the goal bullet, else the first line', () => {
 const st = (spec: string) => [...spec].map(c => (c === 'd' ? 'done' : c === 'c' ? 'current' : 'pending') as ItemState)
 const foldOf = (spec: string) => fold(st(spec), s => s)
 
-test('fold keeps the current item and the next two pending in view', () => {
+test('fold: done runs and later items fold separately, the current and the next item always show', () => {
   expect(foldOf('dddddcpppppp')).toEqual([
     { kind: 'done', from: 0, to: 4 }, { kind: 'item', index: 5 }, { kind: 'item', index: 6 },
-    { kind: 'item', index: 7 }, { kind: 'more', from: 8, to: 11 },
+    { kind: 'later', from: 7, to: 11 },
   ])
-  expect(foldOf('ddpdpppp')).toEqual([
-    { kind: 'done', from: 0, to: 1 }, { kind: 'item', index: 2 }, { kind: 'item', index: 3 },
-    { kind: 'item', index: 4 }, { kind: 'item', index: 5 }, { kind: 'item', index: 6 }, { kind: 'item', index: 7 },
+  // Under three later items nothing folds; one done item does not fold either.
+  expect(foldOf('ddcpp').map(r => r.kind)).toEqual(['done', 'item', 'item', 'item'])
+  expect(foldOf('dcpppp').map(r => r.kind)).toEqual(['item', 'item', 'item', 'later'])
+  expect(foldOf('dcppp')).toEqual([
+    { kind: 'item', index: 0 }, { kind: 'item', index: 1 }, { kind: 'item', index: 2 }, { kind: 'later', from: 3, to: 4 },
   ])
   expect(foldOf('dddddd')).toEqual([{ kind: 'done', from: 0, to: 5 }])
   expect(foldOf('dcp')).toEqual([{ kind: 'item', index: 0 }, { kind: 'item', index: 1 }, { kind: 'item', index: 2 }])
   expect(foldOf('')).toEqual([])
-  const two = foldOf('ddcdcpppp')
-  expect(two.filter(r => r.kind === 'item').map(r => (r as { index: number }).index)).toEqual(expect.arrayContaining([2, 4]))
+  // Not-done items before the current one stay in view; two done runs fold one by one.
+  const two = foldOf('ddpddcpppp')
+  expect(two.map(r => r.kind)).toEqual(['done', 'item', 'done', 'item', 'item', 'later'])
   // Every index exactly once, in order.
-  for (const spec of ['dddddcpppppp', 'ddpdpppp', 'pdpdcdpdpp', 'ccc', 'pppppppp']) {
+  for (const spec of ['dddddcpppppp', 'ddpdpppp', 'pdpdcdpdpp', 'ccc', 'pppppppp', 'ddpddcpppp']) {
     const covered = foldOf(spec).flatMap(r => (r.kind === 'item' ? [r.index] : Array.from({ length: r.to - r.from + 1 }, (_, i) => r.from + i)))
     expect(covered).toEqual([...spec].map((_, i) => i))
   }
 })
 
+test('countTail writes done of total and the share', () => {
+  expect(countTail(1, 3)).toBe('1/3 · 33%')
+  expect(countTail(3, 7)).toBe('3/7 · 43%')
+  expect(countTail(6, 12)).toBe('6/12 · 50%')
+  expect(countTail(0, 0)).toBe('0/0 · 0%')
+})
+
 test('bar layout aligns labels and tails, with no tilde', () => {
-  const bars = [{ label: 'M2 steps', tail: stepsTail(50, 1, 2) }, { label: 'Overall', tail: overallTail(43, true) }]
-  expect(bars.map(b => b.tail)).toEqual([' 50%  1/2', ' 43%  estimate'])
-  expect(barLayout(56, bars)).toEqual({ labelW: 10, barW: 24, tailW: 14 })
+  const bars = [{ label: 'Steps', tail: stepsTail(50, 1, 2) }, { label: 'Overall', tail: overallTail(43, true) }]
+  expect(bars.map(b => b.tail)).toEqual(['1/2 · 50%', ' 43%  estimate'])
+  expect(barLayout(56, bars)).toEqual({ labelW: 9, barW: 24, tailW: 14 })
   expect(barLayout(30, bars).barW).toBe(10)
   expect(barCells(43, 24)).toBe(10)
   expect(barCells(100, 24)).toBe(24)
@@ -503,7 +514,7 @@ test('the bars line up and carry no tilde', async ($, on) => {
   await start($, clock)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(PANE60(surface))
-    const steps = (await ui.find({ type: 'Text', text: /M2 steps/ }))?.text ?? ''
+    const steps = (await ui.find({ type: 'Text', text: /^Steps/ }))?.text ?? ''
     const overall = (await ui.find({ type: 'Text', text: /^Overall/ }))?.text ?? ''
     expect(steps.search(/[█░]/)).toBe(overall.search(/[█░]/))
     expect(steps.search(/[█░]/)).toBeGreaterThan(0)
@@ -522,14 +533,16 @@ test('the header shows state words, slug or id, the questions badge, and the sco
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(PANE60(surface))
     expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo · 1 elsewhere]')
-    const head = (await ui.find({ type: 'Button', key: 'task:app/build' }))?.text
-    expect(head).toMatch(/^▾ build {2}Building {2}43%$/)
+    // An open task is a card: its name on the left, its state on the right.
+    expect((await ui.find({ type: 'Button', key: 'task:app/build' }))?.text).toBe('▾ build')
+    expect((await ui.find({ type: 'Text', text: 'Building' }))).toBeDefined()
     await ui.press({ key: 'scope' })
     expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[all tasks]')
-    expect((await ui.find({ type: 'Button', key: 'task:app/build' }))?.text).toMatch(/^▾ app\/build {2}Building/)
+    expect((await ui.find({ type: 'Button', key: 'task:app/build' }))?.text).toBe('▾ app/build')
     const heads = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('task:'))
     expect(heads.map(b => b.key)).toEqual(['task:other/fix', 'task:app/build'])
-    expect(heads[0]?.text).toMatch(/Waiting for your approval {2}\? 2 questions/)
+    // A folded task keeps its one line: name, state, the questions badge and the overall percent.
+    expect(heads[0]?.text).toMatch(/^▸ other\/fix {2}Waiting for your approval {2}\? 2 questions$/)
     await ui.press({ key: 'scope' })
     await ui.unmount()
   }
@@ -571,16 +584,17 @@ test('a failed fetch after a good one keeps the data and says since when', async
   }
 })
 
-test('sections have headings and the goal is folded to one line until pressed', async ($, on) => {
+test('the card and panels have headings and the goal is folded to one line until pressed', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   const long = { ...PROGRAM, summary: '- goal: build the app with `cargo`\n- approach:\n  - first a **thing**\n  - then another' }
   world(on, { exitCode: 0, stdout: output(long), stderr: '' })
   await start($, clock)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(PANE60(surface))
-    for (const h of ['Goal', 'Now', 'Progress', 'Milestones  1/3 done', 'Steps (M2)']) {
+    for (const h of ['Agents', 'Milestones', 'Steps (M2)', '1/3 · 33%', '1/2 · 50%']) {
       expect(await ui.find({ type: 'Text', text: h })).toBeDefined()
     }
+    expect(await ui.find({ type: 'Text', text: 'Goal' })).toBeUndefined()
     expect((await ui.find({ type: 'Button', key: 'goal:app/build' }))?.text).toBe('▸ build the app with cargo')
     expect(await ui.find({ type: 'Text', text: /then another/ })).toBeUndefined()
     await ui.press({ key: 'goal:app/build' })
@@ -603,13 +617,23 @@ test('a long step list folds around the current step and opens on press', async 
     const ui = await $.ui.mount(PANE60(surface))
     const steps = async () => (await ui.findAll({ type: 'Button' }))
       .filter(b => b.key?.startsWith('step:') || b.key?.startsWith('fold:app/build:steps')).map(b => b.text)
-    expect(await steps()).toEqual(['✓ 1–5 done', expect.stringMatching(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 6 step 6$/), '· 7 step 7', '· 8 step 8', '· 4 more'])
-    await ui.press({ key: 'fold:app/build:steps' })
+    expect(await steps()).toEqual(['✓ 1–5 done', expect.stringMatching(/^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏] 6 step 6$/), '· 7 step 7', '· 5 more'])
+    // Later items open and fold on their own: `▴ fold` sits below its run.
+    await ui.press({ key: 'fold:app/build:steps:later' })
     const open = await steps()
-    expect(open).toHaveLength(13)
-    expect(open[12]).toBe('▴ fold')
-    await ui.press({ key: 'fold:app/build:steps' })
-    expect(await steps()).toHaveLength(5)
+    expect(open).toHaveLength(9)
+    expect(open[0]).toBe('✓ 1–5 done')
+    expect(open[8]).toBe('▴ fold')
+    // Done items open on their own: `▴ fold done` sits above its run.
+    await ui.press({ key: 'fold:app/build:steps:done' })
+    const both = await steps()
+    expect(both).toHaveLength(14)
+    expect(both[0]).toBe('▴ fold done')
+    expect(both[5]).toMatch(/^✓ 5 step 5$/)
+    expect(both[13]).toBe('▴ fold')
+    await ui.press({ key: 'fold:app/build:steps:done' })
+    await ui.press({ key: 'fold:app/build:steps:later' })
+    expect(await steps()).toHaveLength(4)
     await ui.unmount()
   }
 })
@@ -663,7 +687,7 @@ test('a running agent that reports pct gets a bar under its name, as wide as the
     const lines = await barLines(ui)
     expect(lines).toHaveLength(1)
     expect(lines[0]).toMatch(/ {2} 40%$/)
-    const steps = (await ui.find({ type: 'Text', text: /M2 steps/ }))?.text ?? ''
+    const steps = (await ui.find({ type: 'Text', text: /^Steps/ }))?.text ?? ''
     const cells = (t: string) => [...t].filter(c => c === '█' || c === '░').length
     expect(cells(lines[0] ?? '')).toBe(cells(steps))
     // Order: name line, bar line, then the tail line.
@@ -855,7 +879,8 @@ test('the Ask box answers a question from the status of the shown tasks', async 
   await start($, clock)
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount(PANE60(surface))
-    expect(await ui.find({ type: 'Text', text: 'Ask' })).toBeDefined()
+    expect(await ui.find({ type: 'Input', key: 'ask' })).toBeUndefined()
+    await ui.press({ key: 'tab:ask' })
     expect((await ui.find({ type: 'Input', key: 'ask' }))?.props.placeholder).toBe('Ask about these tasks…')
     await ui.input({ key: 'ask', text: '   ' })
     expect(calls).toHaveLength(0)
@@ -871,6 +896,7 @@ test('the Ask box answers a question from the status of the shown tasks', async 
     await ui.press({ key: 'ask-clear' })
     expect(await ui.find({ type: 'Text', text: /implementer is on step 2/ })).toBeUndefined()
     expect(await ui.find({ type: 'Button', key: 'ask-clear' })).toBeUndefined()
+    await ui.press({ key: 'tab:ask' })
     calls.length = 0
     await ui.unmount()
   }
@@ -882,19 +908,23 @@ test('a failed answer says why', async ($, on) => {
   haiku(on, () => ({ reason: 'api-error' }))
   await start($, clock)
   const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'tab:ask' })
   await ui.input({ key: 'ask', text: 'status?' })
   expect((await ui.find({ type: 'Text', text: /no answer/ }))?.text).toBe('no answer: api-error')
   await ui.unmount()
 })
 
-test('mobile draws the pane without the Ask box', async ($, on) => {
+test('mobile draws the pane, and its Ask tab says there is no Ask box', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
   expect(await ui.find({ type: 'Button', key: 'task:app/build' })).toBeDefined()
+  await ui.press({ key: 'tab:ask' })
   expect(await ui.find({ type: 'Input', key: 'ask' })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'Ask' })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /not available/ }))?.text).toBe('Ask is not available here.')
+  await ui.press({ key: 'tab:more' })
+  expect(await ui.find({ type: 'Text', text: 'Advanced options' })).toBeDefined()
   await ui.unmount()
 })
 
@@ -931,6 +961,7 @@ test('an Ask left busy by a lost call expires and the tick stops', async ($, on)
   const ticks = seedState(on, { ask: { state: 'busy', question: 'status?', at: NOW } })
   await start($, clock)
   const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'tab:ask' })
   const a = await glyphOf(ui, /thinking…/)
   await clock.advance(120)
   expect(await glyphOf(ui, /thinking…/)).not.toBe(a)
@@ -974,35 +1005,36 @@ test('a summary left pending by a lost call expires, keeps the raw text, and is 
 
 // -- code index -----------------------------------------------------------------------------------
 
-test('the Index section is folded under Goal and opens to the details', async ($, on) => {
+test('the Index section sits in the More tab, folded, and opens to the details', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: 'Index' })).toBeUndefined()
+  await ui.press({ key: 'tab:more' })
   expect(await ui.find({ type: 'Text', text: 'Index' })).toBeDefined()
-  expect((await ui.find({ type: 'Button', key: 'index:app/build' }))?.text).toBe('▸ stale · 3 behind · 1.4 GB · revised 3m ago  ⚠ stale answers')
+  expect((await ui.find({ type: 'Button', key: 'index' }))?.text).toBe('▸ stale · 3 behind · 1.4 GB · revised 3m ago  ⚠ stale answers')
   expect(await ui.find({ type: 'Text', text: /contents/ })).toBeUndefined()
-  await ui.press({ key: 'index:app/build' })
-  expect((await ui.find({ type: 'Button', key: 'index:app/build' }))?.text).toMatch(/^▾ /)
+  await ui.press({ key: 'index' })
+  expect((await ui.find({ type: 'Button', key: 'index' }))?.text).toMatch(/^▾ /)
   expect((await ui.find({ type: 'Text', text: /^commit/ }))?.text).toMatch(/2a465daf7c · 3 commits behind HEAD/)
   expect(await ui.find({ type: 'Text', text: /d5eb5b06fb/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /485,942 files/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /p50 4 ms · p95 31 ms/ })).toBeDefined()
-  await ui.press({ key: 'index:app/build' })
+  await ui.press({ key: 'index' })
   expect(await ui.find({ type: 'Text', text: /contents/ })).toBeUndefined()
   await ui.unmount()
 })
 
-test('the Index section is left out of tasks of other folders', async ($, on) => {
+test('the Index line is one per pane, not one per task', async ($, on) => {
   const clock = mock.clock(on, { now: NOW })
   world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'scope' })
   await ui.press({ key: 'task:other/fix' })
-  expect(await ui.find({ type: 'Button', key: 'goal:other/fix' })).toBeDefined()
-  expect(await ui.find({ type: 'Button', key: 'index:other/fix' })).toBeUndefined()
-  expect(await ui.find({ type: 'Button', key: 'index:app/build' })).toBeDefined()
+  await ui.press({ key: 'tab:more' })
+  expect((await ui.findAll({ type: 'Button', key: 'index' }))).toHaveLength(1)
   await ui.unmount()
 })
 
@@ -1012,12 +1044,14 @@ test('a missing orch-index says so, and a bad answer says why', async ($, on) =>
   w.index = { exitCode: 127, stdout: '', stderr: '' }
   await start($, clock)
   let ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'tab:more' })
   expect((await ui.find({ type: 'Text', text: /orch-index/ }))?.text).toBe('orch-index is not installed')
   expect(await ui.find({ type: 'Text', text: /Loading|could not run/ })).toBeUndefined()
   await ui.unmount()
 
   w.index = { exitCode: 1, stdout: '', stderr: 'error: not a git repository\nmore' }
   await clock.advance(8000)
+  // The tab stays open between mounts.
   ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   expect((await ui.find({ type: 'Text', text: /orch-index/ }))?.text).toBe('orch-index failed: error: not a git repository')
   await ui.unmount()
@@ -1079,6 +1113,7 @@ test('About lists the version and commit of the skill, index and pane', async ($
   world(on)
   await start($, clock)
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'tab:more' })
   const all = (await ui.findAll({ type: 'Text', text: /./ })).map(t => t.text).join('\n')
   expect(all).toContain('About')
   expect(all).toContain('v0.1.0')
@@ -1086,4 +1121,229 @@ test('About lists the version and commit of the skill, index and pane', async ($
   expect(all).toContain('v0.2.0')
   expect(all).toContain('v0.5.1')
   expect(all).toContain('abc1234')
+})
+
+// -- the status card, the work panel and the folded tabs (ported from the approved mock) ---------------
+
+const allText = async (ui: { findAll: (q: { type: string; text: RegExp }) => Promise<{ text: string }[]> }) =>
+  (await ui.findAll({ type: 'Text', text: /./ })).map(t => t.text).join('\n')
+
+const listOf = (n: number, doneN: number, label: string) => Array.from({ length: n }, (_, k) => {
+  const i = k + 1
+  return { id: String(i), title: `${label} ${i}`, done: i <= doneN, current: i === doneN + 1, summary: `about ${label} ${i}` }
+})
+
+test('the card shows the goal, facts, both bars and the agents; the panel counts milestones and steps', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const text = await allText(ui)
+  for (const want of ['Agents', '1 running', 'Overall  ', 'Steps    ', 'app · standard · roadmap · M2 (two)', 'implementer', 'Milestones', '1/3 · 33%', 'Steps (M2)', '1/2 · 50%']) {
+    expect(text).toContain(want)
+  }
+  expect(text).not.toContain('Now')
+  expect(await ui.find({ type: 'Button', key: 'goal:app/build' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('several agents: three shown, the rest fold behind a count', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const roles = ['implementer:a', 'implementer:b', 'code-reviewer', 'security-reviewer', 'explorer']
+  const five = { ...PROGRAM, running: { ...PROGRAM.running, roles: roles.map(role => ({ role, state: 'in_progress', step: null, note: null })) } }
+  world(on, { exitCode: 0, stdout: output(five), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(await allText(ui)).toContain('5 running')
+  expect(await allText(ui)).toContain('code-reviewer')
+  expect(await allText(ui)).not.toContain('security-reviewer')
+  expect((await ui.find({ type: 'Button', key: 'agents-fold:app/build' }))?.text).toBe('· 2 more')
+  await ui.press({ key: 'agents-fold:app/build' })
+  expect(await allText(ui)).toContain('explorer')
+  expect((await ui.find({ type: 'Button', key: 'agents-fold:app/build' }))?.text).toBe('▴ fold')
+  await ui.press({ key: 'agents-fold:app/build' })
+  expect(await allText(ui)).not.toContain('explorer')
+  await ui.unmount()
+})
+
+test('three agents or fewer show no fold row', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(await ui.find({ type: 'Button', key: 'agents-fold:app/build' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a long plan: done and later items fold separately, and an expanded item shows its text', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const ms = Array.from({ length: 12 }, (_, k) => ({
+    n: k + 1, goal: `milestone ${k + 1}`, size: 'M', state: k < 6 ? 'done' : k === 6 ? 'current' : 'pending', summary: `about milestone ${k + 1}`,
+  }))
+  const long = {
+    ...PROGRAM, milestone_no: 7,
+    milestones: { done: 6, total: 12, items: ms },
+    steps: { ...PROGRAM.steps, total: 30, done: 16, percent: 53, current: ['17'], items: listOf(30, 16, 'step') },
+  }
+  world(on, { exitCode: 0, stdout: output(long), stderr: '' })
+  haiku(on, () => 'Plain words.')
+  memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const text = await allText(ui)
+  expect(text).toContain('6/12 · 50%')
+  expect(text).toContain('16/30 · 53%')
+  expect(text).toContain('✓ M1–M6 done')
+  expect(text).toContain('✓ 1–16 done')
+  expect((await ui.find({ type: 'Button', key: 'fold:app/build:steps:later' }))?.text).toBe('· 12 more')
+
+  await ui.press({ key: 'fold:app/build:steps:done' })
+  expect((await ui.find({ type: 'Button', key: 'fold:app/build:steps:done' }))?.text).toBe('▴ fold done')
+  expect((await ui.find({ type: 'Button', key: 'step:app/build:16' }))?.text).toBe('✓ 16 step 16')
+  // Later items stay folded while done items are open.
+  expect((await ui.find({ type: 'Button', key: 'fold:app/build:steps:later' }))?.text).toBe('· 12 more')
+  await ui.press({ key: 'fold:app/build:steps:later' })
+  expect((await ui.find({ type: 'Button', key: 'step:app/build:30' }))?.text).toBe('· 30 step 30')
+  await ui.press({ key: 'fold:app/build:steps:done' })
+  expect(await allText(ui)).toContain('✓ 1–16 done')
+
+  await ui.press({ key: 'step:app/build:18' })
+  expect(await allText(ui)).toContain('✦ Plain words.')
+  await ui.unmount()
+})
+
+test('one done item and under three later items do not fold', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const small = { ...PROGRAM, steps: { ...PROGRAM.steps, total: 4, done: 1, percent: 25, current: ['2'], items: listOf(4, 1, 'step') } }
+  world(on, { exitCode: 0, stdout: output(small), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '')
+  expect(keys.filter(k => k.startsWith('fold:app/build:steps'))).toEqual([])
+  expect(keys.filter(k => k.startsWith('step:'))).toHaveLength(4)
+  await ui.unmount()
+})
+
+test('a task without milestones shows no Milestones block, and a task without steps no Steps block', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const single = { ...PROGRAM, program: false, milestone: null, milestone_no: null, milestones: null }
+  const w = world(on, { exitCode: 0, stdout: output(single), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const text = await allText(ui)
+  expect(text).not.toContain('Milestones')
+  expect(text).toContain('Steps')
+  expect(text).not.toContain('Steps (M')
+  expect(await ui.find({ type: 'Button', key: 'ms:app/build:1' })).toBeUndefined()
+  await ui.unmount()
+
+  const bare = { ...single, steps: { ...single.steps, total: null, done: null, percent: null, current: null, items: [] } }
+  w.result = { exitCode: 0, stdout: output(bare), stderr: '' }
+  await clock.advance(8000)
+  const ui2 = await $.ui.mount(PANE60('terminal'))
+  expect(await allText(ui2)).not.toContain('Steps (M')
+  expect(await ui2.find({ type: 'Button', key: 'step:app/build:1' })).toBeUndefined()
+  await ui2.unmount()
+})
+
+test('the tabs start folded, a click opens one and a second click folds it', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect((await ui.findAll({ type: 'Button' })).map(b => b.key).filter(k => k?.startsWith('tab:'))).toEqual(['tab:history', 'tab:ask', 'tab:more'])
+  expect(await allText(ui)).not.toContain('Advanced options')
+  expect(await allText(ui)).not.toContain('No answered questions yet.')
+  await ui.press({ key: 'tab:more' })
+  expect(await allText(ui)).toContain('Advanced options')
+  expect(await allText(ui)).toContain('Milestones')
+  await ui.press({ key: 'tab:history' })
+  expect(await allText(ui)).not.toContain('Advanced options')
+  expect(await allText(ui)).toContain('No answered questions yet.')
+  await ui.press({ key: 'tab:history' })
+  expect(await allText(ui)).not.toContain('No answered questions yet.')
+  await ui.unmount()
+})
+
+test('a pane running against an orch with no questions field renders; with one, History lists the answered', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  expect('questions' in PROGRAM).toBe(false)
+  const w = world(on)
+  await start($, clock)
+  let ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'tab:history' })
+  expect(await allText(ui)).toContain('No answered questions yet.')
+  await ui.unmount()
+
+  const opt = { label: 'Yes', text: null, kind: null, recommended: true }
+  const q = (n: number, status: string, topic: string | null) => ({
+    id: `Q${n}`, n, status, text: `Question text ${n}`, topic, group: null, reversible: 'yes', blocks: null, asked_by: null,
+    asked: null, options: [opt], answer: `answer ${n}`, answered: '2026-10-29T10:00Z',
+  })
+  const counts = { open: 0, answered: 1, assumed: 1, withdrawn: 0 }
+  const withQs = { ...PROGRAM, questions: { counts, groups: [], open_group: null, open: [], history: [q(2, 'assumed', null), q(1, 'answered', 'Storage')], history_total: 2 } }
+  w.result = { exitCode: 0, stdout: output(withQs), stderr: '' }
+  await clock.advance(8000)
+  ui = await $.ui.mount(PANE60('terminal'))
+  const rows = (await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('hist:')).map(b => b.text)
+  expect(rows).toEqual(['▸ Question 2: Question text 2', '▸ Question 1: Storage'])
+  const text = await allText(ui)
+  expect(text).toContain('◆ Auto')
+  expect(text).toContain('✓ Answered')
+  await ui.press({ key: 'hist:Q1' })
+  expect(await allText(ui)).toContain('→ answer 1')
+  await ui.unmount()
+})
+
+test('AI summaries off shows the source text, calls no model, hides the summary buttons and is remembered', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on)
+  const store = memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'tab:more' })
+  expect((await ui.find({ type: 'Button', key: 'opt-ai' }))?.text).toMatch(/^\[x\] AI summaries/)
+  await ui.press({ key: 'opt-ai' })
+  expect((await ui.find({ type: 'Button', key: 'opt-ai' }))?.text).toMatch(/^\[ \] AI summaries/)
+  expect(store.get('opt:ai')).toBe(false)
+
+  await ui.press({ key: 'step:app/build:2' })
+  await ui.press({ key: 'goal:app/build' })
+  await ui.press({ key: 'ms:app/build:2' })
+  expect(calls).toHaveLength(0)
+  const text = await allText(ui)
+  expect(text).toContain('change thing 2')
+  expect(text).not.toContain('✦')
+  const keys = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '')
+  expect(keys.filter(k => k.startsWith('plain:') || k.startsWith('raw:'))).toEqual([])
+
+  // On again: the summary button is back.
+  await ui.press({ key: 'opt-ai' })
+  expect(store.get('opt:ai')).toBe(true)
+  expect((await ui.find({ type: 'Button', key: 'plain:step:app/build:2' }))?.text).toBe('✦ plain summary')
+  await ui.unmount()
+})
+
+test('the AI summaries setting is read from the store at session start', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  world(on)
+  const calls = haiku(on)
+  memStore(on, { 'opt:ai': false })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'step:app/build:2' })
+  expect(calls).toHaveLength(0)
+  expect(await allText(ui)).toContain('change thing 2')
+  await ui.press({ key: 'tab:more' })
+  expect((await ui.find({ type: 'Button', key: 'opt-ai' }))?.text).toMatch(/^\[ \] /)
+  await ui.unmount()
+})
+
+test('askContext sends only the question counts, not the questions', () => {
+  const counts = { open: 1, answered: 0, assumed: 0, withdrawn: 0 }
+  const t = task({ questions: { counts, groups: [], open_group: null, open: [], history: [], history_total: 0 } })
+  const sent = JSON.parse(askContext([t]))[0]
+  expect(sent.questions).toEqual({ counts })
+  expect(JSON.parse(askContext([task({})]))[0].questions).toBeUndefined()
 })
