@@ -27,6 +27,37 @@ export type StatusMilestone = {
   summary: string | null
 }
 
+// One parked question of `orch status --json`. An orch from before the questions block has none of this.
+export type StatusOption = { label: string; text: string | null; kind: string | null; recommended: boolean }
+
+export type StatusQuestion = {
+  id: string
+  n: number
+  status: string
+  text: string
+  topic: string | null
+  group: string | null
+  reversible: string | null
+  blocks: string | null
+  asked_by: string | null
+  asked: string | null
+  options: StatusOption[]
+  answer: string | null
+  answered: string | null
+  // `full`, or `compact` / `minimal` once the list's byte budget is spent: those two carry no options. An answered
+  // question past the newest few of the history is `history`: no options, but its answer, time and topic.
+  detail?: 'full' | 'compact' | 'minimal' | 'history'
+}
+
+export type StatusQuestions = {
+  counts: { open: number; answered: number; assumed: number; withdrawn: number }
+  groups: { group: string | null; label: string; counts: { open: number; answered: number; assumed: number; withdrawn: number } }[]
+  open_group: string | null
+  open: StatusQuestion[]
+  history: StatusQuestion[]
+  history_total: number
+}
+
 export type StatusTask = {
   id: string
   repo: string | null
@@ -46,6 +77,8 @@ export type StatusTask = {
   updated: string | null
   last_log: string | null
   questions_open: number | null
+  // Absent on an orch older than the questions block.
+  questions?: StatusQuestions | null
   running: { roles: StatusRole[]; last_spawn: StatusSpawn | null; spawns?: StatusSpawn[] }
   steps: {
     total: number | null
@@ -124,6 +157,34 @@ export type AskState =
   | { state: 'done'; question: string; answer: string }
   | { state: 'error'; question: string; reason: string }
 
+// The folded bottom panel's open tab; null is all folded.
+export type Tab = 'history' | 'ask' | 'more'
+
+// An unsent answer, per task and question id (kept in $.store, D5). `answer` is what Next recorded: the option's
+// label or the typed text. Only a confirmed draft is sent.
+export type Draft = {
+  pick: string | null
+  custom: string | null
+  confirmed: boolean
+  skipped: boolean
+  group: string | null
+  answer: string | null
+}
+export type Drafts = Record<string, Record<string, Draft>>
+
+// What the answering panel remembers between draws: the open question and the open group of each task, the order
+// the questions joined the queue, other groups' questions fetched on demand, and what a Send said.
+export type QState = {
+  current: Record<string, string | null>
+  group: Record<string, string | null>
+  order: Record<string, string[]>
+  fetched: Record<string, StatusQuestion[]>
+  // Full entries (options and all) fetched with `--question-skip` for questions the status block drew without them.
+  full: Record<string, StatusQuestion>
+  sending: Record<string, boolean>
+  error: Record<string, string | null>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'orch-pane': {
@@ -134,6 +195,14 @@ declare module 'claude-code' {
       frame: number
       plain: Record<string, PlainEntry>
       ask: AskState
+      tab: Tab | null
+      ai: boolean
+      notify: boolean
+      compactSend: boolean
+      auto: boolean
+      drafts: Shaped<{ loaded: boolean; byTask: Drafts }>
+      qstate: QState
+      hist: { query: string; page: number }
     }
   }
 }
