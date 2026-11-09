@@ -7,7 +7,7 @@ import {
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, spawnOf, sparkline, stepsTail, textKey,
   WAKE_TEXT, acceptable, answerOf, answersArgv, autoPairs, historyRows, isCritical, mergeOrder, metaText, nextInQueue, optionNote,
-  pageCount, pickCurrent, pickedLabel, staleQuestion, needsHoldRow, openListOf, skipFor,
+  pageCount, pickCurrent, pickedLabel, staleQuestion, togglePick, isChosen, isMulti, needsHoldRow, openListOf, skipFor,
   COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
@@ -1942,6 +1942,27 @@ test('option notes, meta text, queue order and the next question', () => {
   expect(pickCurrent(['Q1', 'Q2'], { Q1: dr(true) }, 'Q1')).toBe('Q2')
   expect(pickCurrent(['Q1', 'Q2'], undefined, 'Q2')).toBe('Q2')
   expect(pickCurrent(['Q1', 'Q2'], undefined, 'Q9')).toBe('Q1')
+})
+
+test('a multi-select question: toggled picks join with `|`; no preselect, no typed text, no accept, no auto', () => {
+  const m = mkq(1, { multi: true, options: [qopt('A', 'x', true), qopt('B', 'y'), qopt('C', 'z')] })
+  expect(isMulti(m)).toBe(true)
+  expect(togglePick(null, 'A')).toBe('A')
+  expect(togglePick('A', 'C')).toBe('A|C')
+  expect(togglePick('A|C', 'A')).toBe('C')
+  expect(togglePick('C', 'C')).toBeNull()
+  expect(togglePick('A|C', 'Hold on')).toBe('Hold on')
+  expect(togglePick('Hold on', 'B')).toBe('B')
+  const d = (pick: string | null, custom: string | null = null): Draft => ({ pick, custom, confirmed: false, skipped: false, group: null, answer: null })
+  expect(answerOf(m, d(null))).toBeNull()                 // the recommended option is not preselected
+  expect(answerOf(m, d('A|C'))).toBe('A|C')
+  expect(answerOf(m, d('A|Z'))).toBeNull()
+  expect(answerOf(m, d('Hold on'))).toBe('Hold on')
+  expect(answerOf(m, d(null, 'free text'))).toBeNull()    // orch refuses free text here
+  expect(isChosen(m, d('A|C'), 'C')).toBe(true)
+  expect(isChosen(m, d('A|C'), 'B')).toBe(false)
+  expect(acceptable(m, undefined)).toBe(false)
+  expect(autoPairs([m], undefined)).toEqual([])
 })
 
 test('answersArgv puts every answer after `--`; staleQuestion and autoPairs read their input strictly', () => {

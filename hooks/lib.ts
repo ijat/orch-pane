@@ -557,14 +557,35 @@ export const HOLD_NOTE = 'Pause this question; nothing changes until you come ba
 // A question that already has an option of that name keeps its own, with its own explanation.
 export const needsHoldRow = (q: StatusQuestion) => !q.options.some(o => o.label.trim().toLowerCase() === HOLD_LABEL.toLowerCase())
 
-const isOption = (q: StatusQuestion, label: string) => label === HOLD_LABEL || q.options.some(o => o.label === label)
+// A multi-select question's answer: the chosen labels joined by `|` (a label never holds one), as `orch answers` expects.
+export const MULTI_SEP = '|'
+export const isMulti = (q: StatusQuestion) => q.multi === true
+
+const chosenOf = (pick: string | null | undefined): string[] => (pick ?? '').split(MULTI_SEP).filter(Boolean)
+
+const isOption = (q: StatusQuestion, label: string) =>
+  isMulti(q)
+    ? (label === HOLD_LABEL || (chosenOf(label).length > 0 && chosenOf(label).every(l => q.options.some(o => o.label === l))))
+    : label === HOLD_LABEL || q.options.some(o => o.label === label)
+
+// A pick after pressing `label` on a multi-select question: toggles it in the set; Hold on stands alone.
+export function togglePick(current: string | null | undefined, label: string): string | null {
+  if (label === HOLD_LABEL) return current === HOLD_LABEL ? null : HOLD_LABEL
+  const set = chosenOf(current).filter(l => l !== HOLD_LABEL)
+  const next = set.includes(label) ? set.filter(l => l !== label) : [...set, label]
+  return next.length > 0 ? next.join(MULTI_SEP) : null
+}
+
+// Whether an option shows as chosen.
+export const isChosen = (q: StatusQuestion, d: Draft | undefined, label: string): boolean =>
+  isMulti(q) ? chosenOf(pickedLabel(q, d)).includes(label) : pickedLabel(q, d) === label
 
 // What Next would record: the typed text, else the picked option, else the recommended one (never for a critical question).
 export function answerOf(q: StatusQuestion, d: Draft | undefined): string | null {
-  const typed = d?.custom?.trim()
+  const typed = isMulti(q) ? undefined : d?.custom?.trim()   // orch refuses free text on a multi-select question
   if (typed) return typed
   if (d?.pick && isOption(q, d.pick)) return d.pick
-  if (isCritical(q)) return null
+  if (isCritical(q) || isMulti(q)) return null
   return recommendedOf(q)?.label ?? null
 }
 
@@ -621,13 +642,13 @@ export function autoPairs(open: readonly StatusQuestion[], drafts: Record<string
     const rec = recommendedOf(q)
     const d = drafts?.[q.id]
     const touched = d && (d.confirmed || d.pick !== null || d.custom !== null || d.skipped)
-    return q.status === 'open' && q.reversible === 'yes' && hasOptions(q) && rec && !touched ? [[q.id, rec.label]] : []
+    return q.status === 'open' && q.reversible === 'yes' && !isMulti(q) && hasOptions(q) && rec && !touched ? [[q.id, rec.label]] : []
   })
 }
 
 // Questions Accept would confirm: open, not critical, with a recommendation, not already confirmed.
 export const acceptable = (q: StatusQuestion, drafts: Record<string, Draft> | undefined) =>
-  q.status === 'open' && !isCritical(q) && hasOptions(q) && recommendedOf(q) !== undefined && !drafts?.[q.id]?.confirmed
+  q.status === 'open' && !isCritical(q) && !isMulti(q) && hasOptions(q) && recommendedOf(q) !== undefined && !drafts?.[q.id]?.confirmed
 
 export const confirmedOf = (drafts: Record<string, Draft> | undefined) =>
   Object.entries(drafts ?? {}).filter(([, d]) => d.confirmed && d.answer)
