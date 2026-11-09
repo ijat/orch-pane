@@ -178,6 +178,8 @@ export type QState = {
   group: Record<string, string | null>
   order: Record<string, string[]>
   fetched: Record<string, StatusQuestion[]>
+  // Full entries (options and all) fetched with `--question-skip` for questions the status block drew without them.
+  full: Record<string, StatusQuestion>
   sending: Record<string, boolean>
   error: Record<string, string | null>
 }

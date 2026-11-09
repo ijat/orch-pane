@@ -549,11 +549,21 @@ export const recommendedOf = (q: StatusQuestion): StatusOption | undefined => q.
 // Whether the entry carries its options. `compact` and `minimal` entries (a long list's tail) do not.
 export const hasOptions = (q: StatusQuestion) => (q.detail ?? 'full') === 'full'
 
+// The last option of every question: pause it. Sending it records the answer "Hold on". It is never preselected,
+// never taken by Accept and never by an auto-answer.
+export const HOLD_LABEL = 'Hold on'
+export const HOLD_NOTE = 'Pause this question; nothing changes until you come back to it.'
+
+// A question that already has an option of that name keeps its own, with its own explanation.
+export const needsHoldRow = (q: StatusQuestion) => !q.options.some(o => o.label.trim().toLowerCase() === HOLD_LABEL.toLowerCase())
+
+const isOption = (q: StatusQuestion, label: string) => label === HOLD_LABEL || q.options.some(o => o.label === label)
+
 // What Next would record: the typed text, else the picked option, else the recommended one (never for a critical question).
 export function answerOf(q: StatusQuestion, d: Draft | undefined): string | null {
   const typed = d?.custom?.trim()
   if (typed) return typed
-  if (d?.pick && q.options.some(o => o.label === d.pick)) return d.pick
+  if (d?.pick && isOption(q, d.pick)) return d.pick
   if (isCritical(q)) return null
   return recommendedOf(q)?.label ?? null
 }
@@ -647,12 +657,24 @@ export function activeGroupOf(t: StatusTask, picked: string | null): string | nu
   return picked !== null && open(picked) ? picked : qq.open_group
 }
 
-// The active group's open questions in full: the status block's own, or the ones fetched for that group.
-export function openListOf(t: StatusTask, picked: string | null, fetched: Record<string, StatusQuestion[]>): StatusQuestion[] {
+// The active group's open questions: the status block's own, or the ones fetched for that group. An entry drawn
+// without its options (a long list's tail) is replaced by its full entry once one was fetched for it.
+export function openListOf(t: StatusTask, picked: string | null, fetched: Record<string, StatusQuestion[]>,
+  full: Record<string, StatusQuestion> = {}): StatusQuestion[] {
   const qq = t.questions
   const label = activeGroupOf(t, picked)
   if (!qq || label === null) return []
-  return label === qq.open_group ? qq.open : fetched[groupKey(t.id, label)] ?? []
+  const list = label === qq.open_group ? qq.open : fetched[groupKey(t.id, label)] ?? []
+  return list.map(e => (hasOptions(e) ? e : full[groupKey(t.id, e.id)] ?? e))
+}
+
+// Where `--question-skip` should start to give the open question and the next one their options: the index in the
+// group's list of the first of them that lacks them, or null when both have theirs.
+export function skipFor(list: readonly StatusQuestion[], order: readonly string[], drafts: Record<string, Draft> | undefined,
+  current: string | null): number | null {
+  const next = current === null ? null : nextInQueue(order, drafts, current)
+  const lacking = [current, next].flatMap(id => (id === null ? [] : list.flatMap((q, i) => (q.id === id && !hasOptions(q) ? [i] : []))))
+  return lacking.length === 0 ? null : Math.min(...lacking)
 }
 
 // The open question: the wanted one while it is not confirmed, else the first still to ask.
