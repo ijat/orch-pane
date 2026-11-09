@@ -1704,6 +1704,17 @@ test('a refused auto-answer is not retried on every poll and shows the error', a
   await ui.unmount()
 })
 
+test('Auto-answer leaves another folder\'s task alone and wakes nobody for it', async ($, on) => {
+  const other = withQs({ ...OTHER, in_cwd: false }, [mkq(1)])
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, []), other])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-auto' })
+  await clock.advance(16000)
+  expect(w.answers).toEqual([])
+  expect(w.wakes).toEqual([])
+  await ui.unmount()
+})
+
 // -- notify -------------------------------------------------------------------------------------------
 
 test('Notify tells of a new question, not of the first look, and only while on', async ($, on) => {
@@ -1766,6 +1777,52 @@ test('200 questions: groups, a long list drawn as a few rows, a critical one sur
   expect(argv.length).toBe(5 + 39 * 2)
   expect(argv).not.toContain('Q33')
   expect(w.wakes).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('a pick made in one group survives switching to the ungrouped group', async ($, on) => {
+  const open = [mkq(1, { group: 'Area A' }), mkq(2, { group: 'Area A' }), mkq(3)]
+  const { ui, w, store } = await pane($, on, [withQs(PROGRAM, open)])
+  w.groups[UNG] = output({ ...withQs(PROGRAM, open), questions: { ...qblock(open), open_group: UNG, open: [open[2]] } })
+  await ui.press({ key: 'app/build:Q1:o1' })
+  expect(JSON.stringify(store.get('drafts'))).toContain('"pick":"Change"')
+  expect(JSON.stringify(store.get('drafts'))).toContain('"group":"Area A"')
+  await ui.press({ key: `group:app/build:${UNG}` })
+  expect(await allText(ui)).toContain('Should item 3 change?')
+  expect(JSON.stringify(store.get('drafts'))).toContain('"Q1"')
+  expect(JSON.stringify(store.get('drafts'))).toContain('"pick":"Change"')
+  // Back in Area A the pick is still the one that shows.
+  await ui.press({ key: 'group:app/build:Area A' })
+  expect(await buttonText(ui, 'app/build:Q1:o1')).toBe('● Change')
+  await ui.unmount()
+})
+
+test('a draft stored before groups were recorded (group null) is kept when a group opens', async ($, on) => {
+  const open = [mkq(1, { group: 'Area A' }), mkq(3)]
+  const old: Draft = { pick: 'Change', custom: null, confirmed: false, skipped: false, group: null, answer: null }
+  const { ui, w, store } = await pane($, on, [withQs(PROGRAM, open)], { drafts: { 'app/build': { Q1: old } } })
+  w.groups[UNG] = output({ ...withQs(PROGRAM, open), questions: { ...qblock(open), open_group: UNG, open: [open[1]] } })
+  await ui.press({ key: `group:app/build:${UNG}` })
+  expect(JSON.stringify(store.get('drafts'))).toContain('"Q1"')
+  await ui.unmount()
+})
+
+test('a new question in another group does not move the open question on a poll', async ($, on) => {
+  const a = [mkq(1, { group: 'Area A' }), mkq(2, { group: 'Area A' })]
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, a)])
+  await ui.press({ key: 'next:app/build' })
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  // Q9 blocks everything, so it sorts first and its group becomes the data's open group.
+  const open = [mkq(9, { group: 'Area B', blocks: 'all' }), ...a]
+  w.result = { exitCode: 0, stdout: output({ ...withQs(PROGRAM, open) }), stderr: '' }
+  w.groups['Area A'] = output({ ...withQs(PROGRAM, open), questions: { ...qblock(open), open_group: 'Area A', open: a } })
+  await clock.advance(8000)
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  expect(await allText(ui)).not.toContain('Should item 9 change?')
+  // When Area A runs out, the data's first group takes over.
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [open[0]!])), stderr: '' }
+  await clock.advance(8000)
+  expect(await allText(ui)).toContain('Should item 9 change?')
   await ui.unmount()
 })
 
@@ -2088,6 +2145,22 @@ test('a compaction that never gets through is not retried until the model asks a
   await askCompact($)
   await endTurn($, clock)
   expect(w.compacts).toHaveLength(1)
+})
+
+test('every retry checks again that nothing runs, and stops when an agent was spawned meanwhile', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($, 'plan')
+  w.compactFails = 1
+  await $.turn.complete(TURN)
+  await clock.settle()
+  expect(w.compacts).toEqual([])
+  // The orchestrator spawned an agent and ended its turn while the first attempt waited.
+  w.result = { exitCode: 0, stdout: output(PROGRAM), stderr: '' }
+  const before = w.runs.length
+  await clock.advance(1000)
+  expect(w.runs.length).toBeGreaterThan(before)
+  expect(w.compacts).toEqual([])
+  expect(w.wakes).toEqual([])
 })
 
 test('Compact, then send: off by default; on, the answers land, the conversation compacts, then the agent is woken', async ($, on) => {
