@@ -27,6 +27,34 @@ export type StatusMilestone = {
   summary: string | null
 }
 
+// One parked question of `orch status --json`. An orch from before the questions block has none of this.
+export type StatusOption = { label: string; text: string | null; kind: string | null; recommended: boolean }
+
+export type StatusQuestion = {
+  id: string
+  n: number
+  status: string
+  text: string
+  topic: string | null
+  group: string | null
+  reversible: string | null
+  blocks: string | null
+  asked_by: string | null
+  asked: string | null
+  options: StatusOption[]
+  answer: string | null
+  answered: string | null
+}
+
+export type StatusQuestions = {
+  counts: { open: number; answered: number; assumed: number; withdrawn: number }
+  groups: { group: string | null; label: string; counts: { open: number; answered: number; assumed: number; withdrawn: number } }[]
+  open_group: string | null
+  open: StatusQuestion[]
+  history: StatusQuestion[]
+  history_total: number
+}
+
 export type StatusTask = {
   id: string
   repo: string | null
@@ -46,6 +74,8 @@ export type StatusTask = {
   updated: string | null
   last_log: string | null
   questions_open: number | null
+  // Absent on an orch older than the questions block.
+  questions?: StatusQuestions | null
   running: { roles: StatusRole[]; last_spawn: StatusSpawn | null; spawns?: StatusSpawn[] }
   steps: {
     total: number | null
@@ -124,6 +154,9 @@ export type AskState =
   | { state: 'done'; question: string; answer: string }
   | { state: 'error'; question: string; reason: string }
 
+// The folded bottom panel's open tab; null is all folded.
+export type Tab = 'history' | 'ask' | 'more'
+
 declare module 'claude-code' {
   interface PluginState {
     'orch-pane': {
@@ -134,6 +167,8 @@ declare module 'claude-code' {
       frame: number
       plain: Record<string, PlainEntry>
       ask: AskState
+      tab: Tab | null
+      ai: boolean
     }
   }
 }

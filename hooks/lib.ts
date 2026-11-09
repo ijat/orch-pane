@@ -430,49 +430,44 @@ export type ItemState = 'done' | 'current' | 'pending'
 export type FoldRow =
   | { kind: 'item'; index: number }
   | { kind: 'done'; from: number; to: number }
-  | { kind: 'more'; from: number; to: number }
+  | { kind: 'later'; from: number; to: number }
 
-// Done items fold into one row per run, pending items past the next `ahead` into one row; the current
-// item, everything not done before it, and the next `ahead` pending items always show.
-export function fold<T>(items: readonly T[], stateOf: (t: T) => ItemState, ahead = 2): FoldRow[] {
+// Done items and later items fold separately. A run of two or more done items folds into one row. Later
+// items fold only when three or more are pending: the next one stays in view, the rest fold. The current
+// item, and anything not done that sits before it, always show.
+export function fold<T>(items: readonly T[], stateOf: (t: T) => ItemState): FoldRow[] {
   const states = items.map(stateOf)
   let anchor = states.indexOf('current')
   if (anchor < 0) {
     const lastDone = states.lastIndexOf('done')
     anchor = states.findIndex((s, i) => i > lastDone && s === 'pending')
   }
-  const shown = states.map(s => s === 'current')
-  if (anchor >= 0) {
-    for (let i = 0; i <= anchor; i++) if (states[i] !== 'done') shown[i] = true
-    let left = ahead
-    for (let i = anchor + 1; i < states.length && left > 0; i++) {
-      if (states[i] === 'pending') {
-        shown[i] = true
-        left--
-      }
-    }
-  } else {
-    states.forEach((s, i) => {
-      if (s !== 'done') shown[i] = true
-    })
-  }
+  const pending = states.flatMap((s, i) => (s === 'pending' && i > anchor ? [i] : []))
+  const foldLater = pending.length >= 3
+  // 'done' and 'later' mark what may fold; anything else always shows.
+  const kinds = states.map((s, i): 'done' | 'later' | null =>
+    s === 'done' ? 'done' : foldLater && i > anchor && i !== pending[0] && s === 'pending' ? 'later' : null)
   const rows: FoldRow[] = []
   let i = 0
   while (i < states.length) {
-    if (shown[i]) {
+    const kind = kinds[i]
+    if (!kind) {
       rows.push({ kind: 'item', index: i })
       i++
       continue
     }
-    const kind = states[i] === 'done' ? 'done' : 'more'
     let j = i
-    while (j + 1 < states.length && !shown[j + 1] && (states[j + 1] === 'done') === (kind === 'done')) j++
+    while (j + 1 < states.length && kinds[j + 1] === kind) j++
     if (j === i) rows.push({ kind: 'item', index: i })
     else rows.push({ kind, from: i, to: j })
     i = j + 1
   }
   return rows
 }
+
+// "3/7 · 43%": done of total, and the share, as a heading's right side.
+export const countTail = (done: number, total: number) =>
+  `${done}/${total} · ${total === 0 ? 0 : Math.round((done / total) * 100)}%`
 
 // -- bars -----------------------------------------------------------------------------------------
 
@@ -488,8 +483,7 @@ export function barLayout(avail: number, bars: readonly { label: string; tail: s
 
 export const barCells = (percent: number, barW: number) => clamp(Math.round((percent / 100) * barW), 0, barW)
 
-export const stepsTail = (percent: number, done: number, total: number) =>
-  `${`${percent}%`.padStart(4)}  ${done}/${total}`
+export const stepsTail = (percent: number, done: number, total: number) => `${done}/${total} · ${percent}%`
 
 export const overallTail = (percent: number, estimate: boolean) =>
   `${percent}%`.padStart(4) + (estimate ? '  estimate' : '')
@@ -569,6 +563,8 @@ function lean(t: StatusTask, items: 'full' | 'clip' | 'none'): Lean {
   const cut = (s: string | null) => (items === 'full' || s === null ? s : items === 'clip' ? clip(s, ITEM_CLIP) : null)
   return {
     ...rest,
+    // The parked questions are answered in the pane, not through Ask: only their counts go to the model.
+    questions: t.questions ? { counts: t.questions.counts } : undefined,
     steps: { ...t.steps, items: t.steps.items.map(s => ({ ...s, summary: cut(s.summary) })) },
     milestones: t.milestones
       ? { ...t.milestones, items: t.milestones.items.map(m => ({ ...m, summary: cut(m.summary) })) }
