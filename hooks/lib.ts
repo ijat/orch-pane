@@ -632,6 +632,32 @@ export const acceptable = (q: StatusQuestion, drafts: Record<string, Draft> | un
 export const confirmedOf = (drafts: Record<string, Draft> | undefined) =>
   Object.entries(drafts ?? {}).filter(([, d]) => d.confirmed && d.answer)
 
+// -- compaction -----------------------------------------------------------------------------------
+
+// The tool the model calls to ask for a compaction: `mcp__<plugin>__<name>`.
+export const COMPACT_TOOL = 'compact_when_idle'
+export const COMPACT_TOOL_FULL = `mcp__orch-pane__${COMPACT_TOOL}`
+
+// Fixed texts, none carrying a caller's words. After a requested compaction the agent is woken once, to re-read
+// its state from orch.
+export const COMPACT_WAKE_TEXT =
+  'orch-pane: the conversation was compacted at your request. Re-read the task state with `orch resume` (or `orch status --json`) and carry on.'
+export const COMPACT_SEND_NOTE =
+  'Keep the task state, the parked questions and the answers just recorded; read them back with `orch` rather than from memory.'
+
+// Why a compaction must wait: a subagent runs, or a spawn was recorded and has not returned. Only tasks of this
+// folder count. Null when nothing runs.
+export function busyReason(tasks: readonly StatusTask[]): string | null {
+  for (const t of tasks.filter(x => x.in_cwd === true && isRunning(x))) {
+    const roles = t.running.roles.map(r => r.role ?? '?')
+    const spawn = t.running.last_spawn
+    return roles.length > 0
+      ? `a subagent is running (${roles.join(', ')}; task ${t.id})`
+      : `${spawn?.role ?? 'a subagent'} was spawned and has not returned (task ${t.id})`
+  }
+  return null
+}
+
 export const HISTORY_PAGE = 10
 
 // Answered and assumed questions matching a search (topic, text, group and answer), in the given order.

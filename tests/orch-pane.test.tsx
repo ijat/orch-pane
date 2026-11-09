@@ -8,6 +8,7 @@ import {
   sortByAttention, spawnOf, sparkline, stepsTail, textKey,
   WAKE_TEXT, acceptable, answerOf, answersArgv, autoPairs, historyRows, isCritical, mergeOrder, metaText, nextInQueue, optionNote,
   pageCount, pickCurrent, pickedLabel, staleQuestion, needsHoldRow, openListOf, skipFor,
+  COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
 import type { Draft, IndexStatus, StatusQuestion, StatusRole, StatusTask } from '../types'
@@ -75,6 +76,8 @@ type World = {
   // `orch status --question-group <label>`: the stdout to give by label, and the runs.
   groups: Record<string, string | ((skip: number) => string)>; groupRuns: string[][]
   wakes: string[]; notes: string[]
+  // The tools registered, `session.compact` calls (their instructions), how many of them fail first, and the order of effects.
+  tools: string[]; compacts: (string | undefined)[]; compactFails: number; order: string[]
 }
 
 const INDEX: IndexStatus = {
@@ -100,7 +103,7 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
                env: Record<string, string> = { HOME: '/home/u' }): World {
   const w: World = {
     runs: [], indexRuns: [], opens: 0, paneOpen: true, placed: true, result, index: INDEX_RAN,
-    answers: [], answered: { exitCode: 0, stdout: 'Q1 answered', stderr: '' }, onAnswers: () => {}, groups: {}, groupRuns: [], wakes: [], notes: [],
+    answers: [], answered: { exitCode: 0, stdout: 'Q1 answered', stderr: '' }, onAnswers: () => {}, groups: {}, groupRuns: [], wakes: [], notes: [], tools: [], compacts: [], compactFails: 0, order: [],
   }
   mock.env(on, env)
   on('session.cwd', () => ({ value: '/proj' }))
@@ -125,6 +128,7 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
     }
     if (e.argv.includes('answers')) {
       w.answers.push([...e.argv])
+      w.order.push('answers')
       if (w.answered.exitCode === 0) w.onAnswers([...e.argv])
       return { value: { ...w.answered, isStdoutTruncated: false, isStderrTruncated: false } }
     }
@@ -144,6 +148,7 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
   on('turn.complete', () => ({ text: '' }))
   on('prompt.submit', (_, e) => {
     w.wakes.push(e.text)
+    w.order.push('wake')
     return { text: e.text }
   })
   on('ui.notify', (_, e) => {
@@ -151,6 +156,19 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
     return { value: { isSent: true as const, channel: 'kitty' as const } }
   })
   on('ui.toast', () => ({ value: undefined }))
+  on('tool.register', (_, e) => {
+    w.tools.push(e.name)
+    return { value: { tool: `mcp__orch-pane__${e.name}` } }
+  })
+  on('session.compact', (_, e) => {
+    if (w.compactFails > 0) {
+      w.compactFails -= 1
+      throw new Error('a turn is running')
+    }
+    w.compacts.push(e.instructions)
+    w.order.push('compact')
+    return { messages: [{ role: 'user' as const, text: 'summary', toolUses: [] }] }
+  })
   return w
 }
 
@@ -1942,4 +1960,182 @@ test('skipFor starts the window at the first of the open and the next question t
   const full2 = { 'app/build\nQ3': mkq(3) }
   const t = { id: 'app/build', questions: qblock(list) } as unknown as StatusTask
   expect(openListOf(t, null, {}, full2).map(q => q.detail)).toEqual(['full', 'full', 'full', 'compact'])
+})
+
+// -- requested compaction ---------------------------------------------------------------------------------
+
+const IDLE_PROGRAM = { ...PROGRAM, running: { roles: [], last_spawn: null } }
+const TURN = { answer: '', durationMs: 1, isAborted: false, turnId: 't1', reason: 'answer' } as const
+const askCompact = ($: Engine, instructions?: string) =>
+  $.tool.call({ tool: COMPACT_TOOL_FULL, ...(instructions === undefined ? {} : { instructions }) })
+const endTurn = async ($: Engine, clock: MockClock, extra: Record<string, unknown> = {}) => {
+  await $.turn.complete({ ...TURN, ...extra } as typeof TURN)
+  await clock.settle()
+}
+
+test('the compaction tool is registered at session start', async ($, on) => {
+  const { w } = await pane($, on, [IDLE_PROGRAM])
+  expect(w.tools).toEqual(['compact_when_idle'])
+  expect(COMPACT_TOOL_FULL).toBe('mcp__orch-pane__compact_when_idle')
+})
+
+test('a request made while nothing runs compacts once, when the turn ends, with the caller\'s instructions, then wakes the agent', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  const r = await askCompact($, 'keep the plan and step 7')
+  expect(String(r.result ?? '')).toContain('Compaction requested')
+  // Not during the turn.
+  expect(w.compacts).toEqual([])
+  await endTurn($, clock)
+  expect(w.compacts).toEqual(['keep the plan and step 7'])
+  expect(w.wakes).toEqual([COMPACT_WAKE_TEXT])
+  expect(COMPACT_WAKE_TEXT).not.toContain('keep the plan')
+  expect(w.order).toEqual(['compact', 'wake'])
+  // At most once per request.
+  await endTurn($, clock)
+  await endTurn($, clock)
+  expect(w.compacts).toHaveLength(1)
+  expect(w.wakes).toHaveLength(1)
+})
+
+test('two calls in one turn make one request', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($, 'first')
+  const again = await askCompact($)
+  expect(String(again.result ?? '')).toContain('already requested')
+  await endTurn($, clock)
+  expect(w.compacts).toEqual(['first'])
+})
+
+test('the tool refuses, with a reason, while a subagent runs or a spawn has not returned', async ($, on) => {
+  const { w, clock } = await pane($, on, [PROGRAM])
+  const refused = await askCompact($, 'x')
+  expect(refused.deny ?? '').toContain('a subagent is running (implementer; task app/build)')
+  expect(refused.deny ?? '').toContain('Ask again at a checkpoint')
+  await endTurn($, clock)
+  expect(w.compacts).toEqual([])
+  expect(w.wakes).toEqual([])
+
+  // A spawn recorded and not returned, with no role row yet: mid-spawn.
+  const spawning = { ...PROGRAM, running: { roles: [], last_spawn: { ...PROGRAM.running.last_spawn, returned: false } } }
+  w.result = { exitCode: 0, stdout: output(spawning), stderr: '' }
+  const mid = await askCompact($)
+  expect(mid.deny ?? '').toContain('implementer was spawned and has not returned (task app/build)')
+  await endTurn($, clock)
+  expect(w.compacts).toEqual([])
+})
+
+test('tasks of other folders do not hold a compaction back', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM, { ...PROGRAM, id: 'other/run', in_cwd: false }])
+  const r = await askCompact($)
+  expect(r.deny).toBeUndefined()
+  await endTurn($, clock)
+  expect(w.compacts).toHaveLength(1)
+})
+
+test('an unreadable orch status refuses too', async ($, on) => {
+  const { w } = await pane($, on, [IDLE_PROGRAM])
+  w.result = { exitCode: 1, stdout: '', stderr: 'orch: broken' }
+  expect((await askCompact($)).deny ?? '').toContain('orch status failed: orch: broken')
+})
+
+test('a request is dropped, with a toast, when something started running before the turn ended', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($)
+  w.result = { exitCode: 0, stdout: output(PROGRAM), stderr: '' }
+  await endTurn($, clock)
+  expect(w.compacts).toEqual([])
+  expect(w.wakes).toEqual([])
+  // Dropped, not kept for later.
+  w.result = { exitCode: 0, stdout: output(IDLE_PROGRAM), stderr: '' }
+  await endTurn($, clock)
+  expect(w.compacts).toEqual([])
+})
+
+test('a subagent\'s turn does not run the request', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($)
+  await endTurn($, clock, { agentId: 'a1' })
+  expect(w.compacts).toEqual([])
+  await endTurn($, clock)
+  expect(w.compacts).toHaveLength(1)
+})
+
+test('while the turn still runs the compaction is retried a second apart, and then runs once', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($, 'plan')
+  w.compactFails = 2
+  await $.turn.complete(TURN)
+  await clock.settle()
+  expect(w.compacts).toEqual([])
+  await clock.advance(1000)
+  expect(w.compacts).toEqual([])
+  await clock.advance(1000)
+  expect(w.compacts).toEqual(['plan'])
+  expect(w.wakes).toEqual([COMPACT_WAKE_TEXT])
+})
+
+test('a compaction that never gets through is not retried until the model asks again', async ($, on) => {
+  const { w, clock } = await pane($, on, [IDLE_PROGRAM])
+  await askCompact($)
+  w.compactFails = 99
+  await $.turn.complete(TURN)
+  await clock.advance(6000)
+  expect(w.compacts).toEqual([])
+  expect(w.wakes).toEqual([])
+  w.compactFails = 0
+  await endTurn($, clock)
+  expect(w.compacts).toEqual([])
+  await askCompact($)
+  await endTurn($, clock)
+  expect(w.compacts).toHaveLength(1)
+})
+
+test('Compact, then send: off by default; on, the answers land, the conversation compacts, then the agent is woken', async ($, on) => {
+  const { ui, w, store } = await pane($, on, [withQs(IDLE_PROGRAM, [mkq(1)])])
+  await ui.press({ key: 'send:app/build' })
+  expect(w.compacts).toEqual([])
+  expect(w.order).toEqual(['answers', 'wake'])
+
+  w.result = { exitCode: 0, stdout: output(withQs(IDLE_PROGRAM, [mkq(2)])), stderr: '' }
+  await ui.press({ key: 'tab:more' })
+  expect(await buttonText(ui, 'opt-compact-send')).toMatch(/^\[ \] Compact, then send/)
+  await ui.press({ key: 'opt-compact-send' })
+  expect(store.get('opt:compact-send')).toBe(true)
+  w.order.length = 0
+  await ui.press({ key: 'send:app/build' })
+  expect(w.order).toEqual(['answers', 'compact', 'wake'])
+  expect(w.compacts[0]).toContain('read them back with `orch`')
+  expect(w.wakes).toEqual([WAKE_TEXT, WAKE_TEXT])
+  await ui.unmount()
+})
+
+test('Compact, then send skips the compaction while an agent runs, and still sends and wakes', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1)])])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-compact-send' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.compacts).toEqual([])
+  expect(w.order).toEqual(['answers', 'wake'])
+  await ui.unmount()
+})
+
+test('Compact, then send does not compact when the answers failed', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(IDLE_PROGRAM, [mkq(1)])])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-compact-send' })
+  w.answered = { exitCode: 1, stdout: '', stderr: 'orch: boom' }
+  await ui.press({ key: 'send:app/build' })
+  expect(w.compacts).toEqual([])
+  expect(w.wakes).toEqual([])
+  await ui.unmount()
+})
+
+test('busyReason names the running roles, a spawn that has not returned, and ignores other folders', () => {
+  const spawn = { ts: 't', role: 'planner', agent: 'orch-planner', tier: 'opus/high', steps: null, milestone: null, returned: false }
+  expect(busyReason([task({ running: { roles: [{ role: 'implementer', state: 'in_progress', step: null, note: null }, { role: 'code-reviewer', state: 'in_progress', step: null, note: null }], last_spawn: null } })]))
+    .toBe('a subagent is running (implementer, code-reviewer; task r/t)')
+  expect(busyReason([task({ running: { roles: [], last_spawn: spawn } })])).toBe('planner was spawned and has not returned (task r/t)')
+  expect(busyReason([task({ running: { roles: [], last_spawn: { ...spawn, returned: true } } })])).toBeNull()
+  expect(busyReason([task({ in_cwd: false, running: { roles: [], last_spawn: spawn } })])).toBeNull()
+  expect(busyReason([])).toBeNull()
 })

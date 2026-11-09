@@ -9,6 +9,7 @@ import {
   HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
   historyRows, isCritical, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
   recommendedOf, skipFor, staleQuestion, UNGROUPED, HOLD_LABEL, HOLD_NOTE,
+  COMPACT_SEND_NOTE, COMPACT_TOOL, COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -39,6 +40,9 @@ const AI_KEY = 'opt:ai'
 // Notify (also kept in $.store) and Auto-answer (this session only: it answers for the person, so it starts off).
 const notify = atom({ plugin: 'orch-pane', key: 'notify' } as const, false)
 const NOTIFY_KEY = 'opt:notify'
+// Compact, then send (also kept in $.store): a Send compacts the conversation before it wakes the agent.
+const compactSend = atom({ plugin: 'orch-pane', key: 'compactSend' } as const, false)
+const COMPACT_SEND_KEY = 'opt:compact-send'
 const auto = atom({ plugin: 'orch-pane', key: 'auto' } as const, false)
 // Unsent answers (D5): the atom serves the drawing, $.store keeps them; a pane whose atom was lost reloads them.
 const EMPTY_DRAFTS: { loaded: boolean; byTask: Drafts } = { loaded: false, byTask: {} }
@@ -333,6 +337,89 @@ async function wake($: EngineInterface): Promise<string | null> {
   }
 }
 
+// -- compaction ------------------------------------------------------------------------------------
+// The model asks through the `compact_when_idle` tool; the request waits for the turn to end, then runs once. The
+// same compaction serves the `Compact, then send` option. Both refuse while anything runs, read from `orch status`.
+
+const COMPACT_TRIES = 5
+const COMPACT_RETRY_MS = 1000
+
+// A request in the making: null, or what the model asked the summary to keep. Cleared when it runs or is refused.
+let compactAsked: { instructions: string | null } | null = null
+let compactRunning = false
+
+// Why a compaction must wait, from a fresh `orch status --json`: null when nothing runs, else the reason. A status
+// that cannot be read is a reason too: an unknown state is not an idle one.
+async function whyNotNow($: EngineInterface): Promise<string | null> {
+  const where = await whereIsOrch($)
+  if (!where) return 'orch could not be found (HOME is not set)'
+  let ran
+  try {
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd], { timeoutMs: RUN_TIMEOUT_MS })
+  } catch (err) {
+    return `orch status could not run: ${errorText(err)}`
+  }
+  if (ran.exitCode !== 0) return `orch status failed: ${firstLine(ran.stderr) || `exit ${ran.exitCode}`}`
+  try {
+    const data = JSON.parse(ran.stdout) as StatusJson
+    if (!data || data.schema !== 1 || !Array.isArray(data.tasks)) return 'orch status printed an unsupported answer'
+    return busyReason(data.tasks)
+  } catch {
+    return 'orch status printed something that is not JSON'
+  }
+}
+
+// One compaction between turns: null when it ran, else why not. `$.session.compact` rejects while a turn runs, and
+// the turn that asked has only just completed, so it is tried a few times a second apart.
+async function compactNow($: EngineInterface, instructions: string | null): Promise<string | null> {
+  if (compactRunning) return 'a compaction is already running'
+  compactRunning = true
+  try {
+    const why = await whyNotNow($)
+    if (why) return why
+    let last = 'the session did not become idle'
+    for (let i = 0; i < COMPACT_TRIES; i++) {
+      try {
+        const r = await $.session.compact(instructions ? { instructions } : {})
+        return r.skip === undefined ? null : `the compaction was vetoed: ${r.skip}`
+      } catch (err) {
+        last = errorText(err)
+        if (i < COMPACT_TRIES - 1) await $.clock.sleep(COMPACT_RETRY_MS)
+      }
+    }
+    return last
+  } finally {
+    compactRunning = false
+  }
+}
+
+// At the end of a main-loop turn: runs the request the model made, once. The request is cleared first, so a
+// compaction that fails or is refused is not retried until the model asks again.
+async function runRequestedCompact($: EngineInterface) {
+  const asked = compactAsked
+  compactAsked = null
+  if (!asked) return
+  const why = await compactNow($, asked.instructions)
+  if (why) {
+    $.ui.toast(`Compaction skipped: ${why}`)
+    return
+  }
+  await $.prompt.submit({ text: COMPACT_WAKE_TEXT }).catch(() => undefined)
+}
+
+// The model-callable tool: records a request, or refuses with a reason while a subagent runs.
+async function requestCompact($: EngineInterface, instructions: string | null): Promise<{ deny: string } | { result: string }> {
+  const why = await whyNotNow($)
+  if (why) return { deny: `Not compacting now: ${why}. Ask again at a checkpoint when nothing is running.` }
+  const again = compactAsked !== null
+  compactAsked = { instructions: instructions ?? compactAsked?.instructions ?? null }
+  return {
+    result: again
+      ? 'A compaction is already requested; it runs once, when this turn ends.'
+      : 'Compaction requested. It runs once, when this turn ends, and you are woken afterwards: re-read the task state with `orch` then.',
+  }
+}
+
 // The task's questions as drawn: its open group's, the order they joined the queue, and the question that is open.
 function viewOf(t: StatusTask, q: QState, ds: Drafts) {
   const qq = t.questions
@@ -576,6 +663,8 @@ async function loadAi($: EngineInterface) {
     if (typeof stored === 'boolean') await update($, ai, () => stored)
     const notified = await $.store.get(NOTIFY_KEY)
     if (typeof notified === 'boolean') await update($, notify, () => notified)
+    const compacting = await $.store.get(COMPACT_SEND_KEY)
+    if (typeof compacting === 'boolean') await update($, compactSend, () => compacting)
   } catch {
     // The defaults stay: AI summaries on, notifications off.
   }
@@ -586,6 +675,16 @@ async function toggleNotify($: EngineInterface) {
   await update($, notify, () => next)
   try {
     await $.store.set(NOTIFY_KEY, next)
+  } catch {
+    // This session keeps it.
+  }
+}
+
+async function toggleCompactSend($: EngineInterface) {
+  const next = (await read($, compactSend)) !== true
+  await update($, compactSend, () => next)
+  try {
+    await $.store.set(COMPACT_SEND_KEY, next)
   } catch {
     // This session keeps it.
   }
@@ -698,6 +797,12 @@ async function sendTask($: EngineInterface, t: StatusTask, last?: StatusQuestion
     return
   }
   await writeDrafts($, all => withoutDrafts(all, t.id, pairs.map(p => p[0])))
+  // Compact, then send: with the option on, the conversation is compacted after the answers are on disk and
+  // before the wake. A refusal (something runs) skips the compaction and still wakes.
+  if ((await read($, compactSend)) === true) {
+    const why = await compactNow($, COMPACT_SEND_NOTE)
+    if (why) $.ui.toast(`Not compacted: ${why}`)
+  }
   const woke = await wake($)
   await setQ($, t.id, { sending: false, error: woke ? `The answers are saved; the agent could not be woken: ${woke}` : null })
   await fetchStatus($)
@@ -751,6 +856,18 @@ export const register: Register = on => {
       name: 'orch-pane',
       description: 'Show the orchestration tasks of this repo in a pane',
     })
+    try {
+      await $.tool.register({
+        name: COMPACT_TOOL,
+        description: 'Ask orch-pane to compact this conversation when the current turn ends, once. Use only at a checkpoint, when no subagent runs '
+          + 'and nothing is mid-spawn; it refuses otherwise. `instructions` says what the summary must keep. Afterwards you are woken: re-read the state from orch.',
+        inputSchema: { type: 'object', properties: { instructions: { type: 'string', description: 'What the summary should keep or stress' } }, additionalProperties: false },
+      })
+    } catch {
+      // No tool this session; the pane works without it.
+    }
+    compactAsked = null
+    compactRunning = false
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
     $.clock.every(SPIN_MS, () => void spinIfRunning($))
     // A reload starts from a clean slate: what the poll saw last, and the auto-answers that failed.
@@ -779,9 +896,17 @@ export const register: Register = on => {
     return { text: 'Orchestration pane opened.' }
   })
 
+  // The tool the model calls to ask for a compaction (served below). Registered before the first prompt.
+  on('tool.call', { tool: COMPACT_TOOL_FULL }, async ($, e) => {
+    const given = e.instructions
+    return requestCompact($, typeof given === 'string' && given.trim() ? given.trim() : null)
+  })
+
   on('turn.complete', async ($, e, next) => {
     const done = await next(e)
     void refreshIfOpen($)
+    // A subagent's own turn.complete carries its agentId; only the main loop's end runs a requested compaction.
+    if (e.agentId === undefined) void runRequestedCompact($)
 
     return done
   })
@@ -811,6 +936,7 @@ export const register: Register = on => {
     const aiOn = (await read($, ai)) !== false
     const autoOn = (await read($, auto)) === true
     const notifyOn = (await read($, notify)) === true
+    const compactSendOn = (await read($, compactSend)) === true
     const qs = await readQ($)
     const stored = await read($, drafts)
     const ds: Drafts = stored && typeof stored.byTask === 'object' && stored.byTask ? stored.byTask : {}
@@ -1432,6 +1558,7 @@ export const register: Register = on => {
         check('opt-ai', aiOn, 'AI summaries: goal, milestones, steps', 'off shows the original text', () => toggleAi($)),
         check('opt-auto', autoOn, 'Auto-answer with recommended', 'reversible questions only; History shows ◆ Auto', () => toggleAuto($)),
         check('opt-notify', notifyOn, 'Notify me when a question arrives', null, () => toggleNotify($)),
+        check('opt-compact-send', compactSendOn, 'Compact, then send', 'sending answers compacts the conversation first; skipped while an agent runs', () => toggleCompactSend($)),
         ...(snap.about
           ? [
               subhead('About'),
