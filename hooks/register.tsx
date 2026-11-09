@@ -370,15 +370,17 @@ async function whyNotNow($: EngineInterface): Promise<string | null> {
 }
 
 // One compaction between turns: null when it ran, else why not. `$.session.compact` rejects while a turn runs, and
-// the turn that asked has only just completed, so it is tried a few times a second apart.
+// the turn that asked has only just completed, so it is tried a few times a second apart, each time after a fresh
+// check that nothing runs.
 async function compactNow($: EngineInterface, instructions: string | null): Promise<string | null> {
   if (compactRunning) return 'a compaction is already running'
   compactRunning = true
   try {
-    const why = await whyNotNow($)
-    if (why) return why
     let last = 'the session did not become idle'
     for (let i = 0; i < COMPACT_TRIES; i++) {
+      // Every attempt re-reads what runs: the turn that kept the first one out may have spawned an agent and ended.
+      const why = await whyNotNow($)
+      if (why) return why
       try {
         const r = await $.session.compact(instructions ? { instructions } : {})
         return r.skip === undefined ? null : `the compaction was vetoed: ${r.skip}`
@@ -441,21 +443,28 @@ async function reconcile($: EngineInterface) {
   const q = await readQ($)
   const current = { ...q.current }
   const order = { ...q.order }
+  const pins: [string, string][] = []
   let dropped: Drafts = ds
   for (const t of data.tasks) {
     if (!t.questions) continue
     const v = viewOf(t, q, ds)
     order[t.id] = v.order
     current[t.id] = v.current?.id ?? null
+    // The group being answered stays the one the person is in while it has open questions; a new question in
+    // another group, even one that sorts first, does not move them.
+    if (v.label !== null && q.group[t.id] == null) pins.push([t.id, v.label])
     // Only a loaded group says which of its questions are still open.
     const loaded = v.label === t.questions.open_group || q.fetched[groupKey(t.id, v.label ?? '')] !== undefined
     if (loaded) {
-      const stale = Object.entries(ds[t.id] ?? {}).filter(([id, d]) => (d.group ?? UNGROUPED) === v.label && !v.byId.has(id)).map(([id]) => id)
+      const stale = Object.entries(ds[t.id] ?? {}).filter(([id, d]) => d.group !== null && d.group === v.label && !v.byId.has(id)).map(([id]) => id)
       if (stale.length > 0) dropped = withoutDrafts(dropped, t.id, stale)
     }
   }
   if (dropped !== ds) await writeDrafts($, () => dropped)
-  await patchQ($, s => ({ ...s, current, order }))
+  await patchQ($, s => ({
+    ...s, current, order,
+    group: { ...s.group, ...Object.fromEntries(pins.filter(([id]) => s.group[id] == null)) },
+  }))
 }
 
 // Question counts seen last, to tell a new arrival from the first look; and pairs an auto-answer already failed on.
@@ -493,7 +502,8 @@ async function autoPass($: EngineInterface) {
     const q = await readQ($)
     let landed = false
     for (const t of data.tasks) {
-      if (!t.questions) continue
+      // Only this folder's tasks: another repo's decisions are not taken here, and this session is not woken for them.
+      if (!t.questions || t.in_cwd !== true) continue
       const pairs = autoPairs(viewOf(t, q, ds).list, ds[t.id]).filter(([id]) => !autoDone.get(t.id)?.has(id))
       const sig = pairs.map(p => p.join('=')).join('|')
       if (pairs.length === 0 || autoFailed.get(t.id) === sig) continue
@@ -721,13 +731,22 @@ async function viewNow($: EngineInterface, t: StatusTask) {
   return viewOf(t, await readQ($), await draftsOf($))
 }
 
+// The group a draft belongs to is the one open when it is made, so a group switch before Next never mistakes a
+// pick for another group's. A draft stored before this had `group: null`; it keeps it and is never dropped by group.
+async function groupNow($: EngineInterface, taskId: string): Promise<string | null> {
+  const t = (await read($, snapshot))?.data?.tasks.find(x => x.id === taskId)
+  return t?.questions ? (await viewNow($, t)).label : null
+}
+
 async function chooseOption($: EngineInterface, taskId: string, qid: string, label: string) {
-  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: label, custom: null, confirmed: false }))
+  const group = await groupNow($, taskId)
+  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: label, custom: null, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
 }
 
 async function typeAnswer($: EngineInterface, taskId: string, qid: string, text: string) {
   const custom = text.trim() || null
-  await writeDrafts($, all => withDraft(all, taskId, qid, { custom, confirmed: false }))
+  const group = await groupNow($, taskId)
+  await writeDrafts($, all => withDraft(all, taskId, qid, { custom, confirmed: false, group: draftOf(all, taskId, qid)?.group ?? group }))
 }
 
 // Next: the open question's answer counts from here (a pick before Next is only a draft), and the next one opens.
