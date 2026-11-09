@@ -1,11 +1,14 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, RenderChildren } from 'claude-code'
 
-import type { About, AboutPart, AskState, IndexStatus, PlainEntry, Snapshot, StatusJson, StatusMilestone, StatusStep, StatusTask, Tab } from '../types'
+import type { About, AboutPart, AskState, Draft, Drafts, IndexStatus, PlainEntry, QState, Snapshot, StatusJson, StatusMilestone, StatusQuestion, StatusStep, StatusTask, Tab } from '../types'
 import {
   GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, countTail, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
   scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
+  HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
+  historyRows, isCritical, mergeOrder, metaText, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
+  recommendedOf, staleQuestion, UNGROUPED,
 } from './lib'
 import type { ItemState, MdLine } from './lib'
 
@@ -33,9 +36,20 @@ const ask = atom({ plugin: 'orch-pane', key: 'ask' } as const, IDLE)
 const tab = atom({ plugin: 'orch-pane', key: 'tab' } as const, null as Tab | null)
 const ai = atom({ plugin: 'orch-pane', key: 'ai' } as const, true)
 const AI_KEY = 'opt:ai'
+// Notify (also kept in $.store) and Auto-answer (this session only: it answers for the person, so it starts off).
+const notify = atom({ plugin: 'orch-pane', key: 'notify' } as const, false)
+const NOTIFY_KEY = 'opt:notify'
+const auto = atom({ plugin: 'orch-pane', key: 'auto' } as const, false)
+// Unsent answers (D5): the atom serves the drawing, $.store keeps them; a pane whose atom was lost reloads them.
+const EMPTY_DRAFTS: { loaded: boolean; byTask: Drafts } = { loaded: false, byTask: {} }
+const drafts = atom({ plugin: 'orch-pane', key: 'drafts' } as const, EMPTY_DRAFTS, { shape: 'drafts-1' })
+const DRAFTS_KEY = 'drafts'
+const EMPTY_Q: QState = { current: {}, group: {}, order: {}, fetched: {}, sending: {}, error: {} }
+const qstate = atom({ plugin: 'orch-pane', key: 'qstate' } as const, EMPTY_Q)
+const hist = atom({ plugin: 'orch-pane', key: 'hist' } as const, { query: '', page: 0 })
 
 const AGENTS_SHOWN = 3
-const HISTORY_SHOWN = 10
+const ROWS_SHOWN = 8
 const SPIN_MS = 120
 const FRAME_WRAP = 3600
 const SPINNER = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏']
@@ -125,7 +139,7 @@ async function fetchAbout($: EngineInterface, home: string, windows: boolean): P
 }
 
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
-async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
+async function fetchStatusOnce($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
   inFlight = true
   try {
@@ -174,6 +188,241 @@ async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
   } finally {
     inFlight = false
   }
+}
+
+// -- answering -------------------------------------------------------------------------------------
+// The questions of `orch status --json` are answered through `orch answers`, never by writing the file. Unsent
+// picks are drafts (D5). One wake, a fixed text, follows each batch that landed on disk.
+
+const asQ = (raw: QState | undefined): QState => ({ ...EMPTY_Q, ...(raw && typeof raw === 'object' ? raw : {}) })
+const readQ = async ($: EngineInterface) => asQ(await read($, qstate))
+const patchQ = ($: EngineInterface, f: (q: QState) => QState) => update($, qstate, s => f(asQ(s)))
+const setQ = ($: EngineInterface, taskId: string, patch: { current?: string | null; group?: string | null; error?: string | null; sending?: boolean }) =>
+  patchQ($, q => ({
+    ...q,
+    current: 'current' in patch ? { ...q.current, [taskId]: patch.current ?? null } : q.current,
+    group: 'group' in patch ? { ...q.group, [taskId]: patch.group ?? null } : q.group,
+    error: 'error' in patch ? { ...q.error, [taskId]: patch.error ?? null } : q.error,
+    sending: 'sending' in patch ? { ...q.sending, [taskId]: patch.sending === true } : q.sending,
+  }))
+
+async function loadDrafts($: EngineInterface) {
+  const cur = await read($, drafts)
+  if (cur?.loaded === true && cur.byTask && typeof cur.byTask === 'object') return
+  let byTask: Drafts = {}
+  try {
+    const stored = await $.store.get(DRAFTS_KEY)
+    if (stored && typeof stored === 'object') byTask = stored as Drafts
+  } catch {
+    // No drafts to restore.
+  }
+  await update($, drafts, () => ({ loaded: true, byTask }))
+}
+
+const draftsOf = async ($: EngineInterface): Promise<Drafts> => {
+  await loadDrafts($)
+  return (await read($, drafts)).byTask
+}
+
+async function writeDrafts($: EngineInterface, f: (all: Drafts) => Drafts) {
+  const next = f(await draftsOf($))
+  await update($, drafts, () => ({ loaded: true, byTask: next }))
+  try {
+    await $.store.set(DRAFTS_KEY, next)
+  } catch {
+    // This session keeps them; a restart loses the unsent picks.
+  }
+}
+
+const withDraft = (all: Drafts, taskId: string, qid: string, patch: Partial<Draft>): Drafts =>
+  ({ ...all, [taskId]: { ...(all[taskId] ?? {}), [qid]: { ...NO_DRAFT, ...(all[taskId]?.[qid] ?? {}), ...patch } } })
+
+const withoutDrafts = (all: Drafts, taskId: string, ids: readonly string[]): Drafts => {
+  const mine = Object.fromEntries(Object.entries(all[taskId] ?? {}).filter(([id]) => !ids.includes(id)))
+  const { [taskId]: _gone, ...rest } = all
+  return Object.keys(mine).length > 0 ? { ...rest, [taskId]: mine } : rest
+}
+
+type Where = { windows: boolean; home: string; orch: string; cwd: string }
+
+async function whereIsOrch($: EngineInterface): Promise<Where | null> {
+  const windows = (await $.env.get('OS')) === 'Windows_NT'
+  const home = windows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
+  if (!home) return null
+  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd() }
+}
+
+// Another group's open questions, in full: `orch status --json --question-group <label>`, kept by task and group.
+async function loadGroup($: EngineInterface, label: string) {
+  const where = await whereIsOrch($)
+  if (!where) return
+  let ran
+  try {
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, '--question-group', label],
+      { timeoutMs: RUN_TIMEOUT_MS })
+  } catch {
+    return
+  }
+  if (ran.exitCode !== 0) return
+  let data: StatusJson
+  try {
+    data = JSON.parse(ran.stdout) as StatusJson
+  } catch {
+    return
+  }
+  if (!data || data.schema !== 1 || !Array.isArray(data.tasks)) return
+  const got = Object.fromEntries(data.tasks.map(t => [groupKey(t.id, label), t.questions?.open ?? []]))
+  await patchQ($, q => ({ ...q, fetched: { ...q.fetched, ...got } }))
+}
+
+type Sent = { ok: true } | { ok: false; error: string; stale: string | null }
+
+// `orch answers` for one task. The answers are argv elements: no shell, no quoting.
+async function runAnswers($: EngineInterface, taskId: string, pairs: readonly [string, string][], isAuto: boolean): Promise<Sent> {
+  const where = await whereIsOrch($)
+  if (!where) return { ok: false, error: 'orch answers could not run: HOME is not set', stale: null }
+  let ran
+  try {
+    ran = await $.process.run(answersArgv(where.windows, where.orch, taskId, pairs, isAuto), { timeoutMs: RUN_TIMEOUT_MS })
+  } catch (err) {
+    return { ok: false, error: `orch answers could not run: ${errorText(err)}`, stale: null }
+  }
+  if (ran.exitCode !== 0) {
+    return { ok: false, error: `orch answers failed: ${firstLine(ran.stderr) || `exit ${ran.exitCode}`}`, stale: staleQuestion(ran.stderr) }
+  }
+  return { ok: true }
+}
+
+// One wake per batch, after the answers are on disk. The text is fixed: no answer goes through it.
+async function wake($: EngineInterface): Promise<string | null> {
+  try {
+    await $.prompt.submit({ text: WAKE_TEXT })
+    return null
+  } catch (err) {
+    return errorText(err)
+  }
+}
+
+// The task's questions as drawn: its open group's, the order they joined the queue, and the question that is open.
+function viewOf(t: StatusTask, q: QState, ds: Drafts) {
+  const qq = t.questions
+  const label = activeGroupOf(t, q.group[t.id] ?? null)
+  const list = openListOf(t, q.group[t.id] ?? null, q.fetched)
+  const byId = new Map(list.map(x => [x.id, x]))
+  const seen = (q.order[t.id] ?? []).filter(id => byId.has(id))
+  const order = mergeOrder(seen, list.map(x => x.id))
+  const mine = ds[t.id] ?? {}
+  const current = pickCurrent(order, mine, q.current[t.id] ?? null)
+  return { qq, label, list, byId, order, mine, current: current === null ? null : byId.get(current) ?? null }
+}
+
+// Keeps each task's open question and queue order across polls, and drops drafts of questions that are no longer open.
+async function reconcile($: EngineInterface) {
+  const data = (await read($, snapshot))?.data
+  if (!data) return
+  const ds = await draftsOf($)
+  const q = await readQ($)
+  const current = { ...q.current }
+  const order = { ...q.order }
+  let dropped: Drafts = ds
+  for (const t of data.tasks) {
+    if (!t.questions) continue
+    const v = viewOf(t, q, ds)
+    order[t.id] = v.order
+    current[t.id] = v.current?.id ?? null
+    // Only a loaded group says which of its questions are still open.
+    const loaded = v.label === t.questions.open_group || q.fetched[groupKey(t.id, v.label ?? '')] !== undefined
+    if (loaded) {
+      const stale = Object.entries(ds[t.id] ?? {}).filter(([id, d]) => (d.group ?? UNGROUPED) === v.label && !v.byId.has(id)).map(([id]) => id)
+      if (stale.length > 0) dropped = withoutDrafts(dropped, t.id, stale)
+    }
+  }
+  if (dropped !== ds) await writeDrafts($, () => dropped)
+  await patchQ($, s => ({ ...s, current, order }))
+}
+
+// Question counts seen last, to tell a new arrival from the first look; and pairs an auto-answer already failed on.
+const lastOpen = new Map<string, number>()
+const autoFailed = new Map<string, string>()
+// Questions an auto-answer already took this session: a poll that still lists one (a slow status) never takes it twice.
+const autoDone = new Map<string, Set<string>>()
+let autoBusy = false
+
+async function notifyNew($: EngineInterface, data: StatusJson) {
+  const on_ = (await read($, notify)) === true
+  for (const t of data.tasks) {
+    const open = t.questions?.counts.open ?? 0
+    const before = lastOpen.get(t.id)
+    lastOpen.set(t.id, open)
+    if (on_ && before !== undefined && open > before) {
+      const n = open - before
+      try {
+        await $.ui.notify(`${t.slug ?? t.id}: ${plural(n, 'new question')} waiting for you`)
+      } catch {
+        // A refused notification is not worth more than the pane's own count.
+      }
+    }
+  }
+}
+
+// Answers the reversible, recommended questions nobody has touched, through `orch answers --auto`, then wakes once.
+async function autoPass($: EngineInterface) {
+  if (autoBusy || (await read($, auto)) !== true) return
+  autoBusy = true
+  try {
+    const data = (await read($, snapshot))?.data
+    if (!data) return
+    const ds = await draftsOf($)
+    const q = await readQ($)
+    let landed = false
+    for (const t of data.tasks) {
+      if (!t.questions) continue
+      const pairs = autoPairs(viewOf(t, q, ds).list, ds[t.id]).filter(([id]) => !autoDone.get(t.id)?.has(id))
+      const sig = pairs.map(p => p.join('=')).join('|')
+      if (pairs.length === 0 || autoFailed.get(t.id) === sig) continue
+      const r = await runAnswers($, t.id, pairs, true)
+      if (r.ok) {
+        autoFailed.delete(t.id)
+        autoDone.set(t.id, new Set([...(autoDone.get(t.id) ?? []), ...pairs.map(([id]) => id)]))
+        landed = true
+      } else {
+        autoFailed.set(t.id, sig)
+        await setQ($, t.id, { error: r.error })
+      }
+    }
+    if (landed) {
+      await wake($)
+      autoBusy = false
+      await fetchStatus($)
+    }
+  } finally {
+    autoBusy = false
+  }
+}
+
+async function afterFetch($: EngineInterface, data: StatusJson) {
+  try {
+    await loadDrafts($)
+    const q = await readQ($)
+    const wanted = new Set<string>()
+    for (const t of data.tasks) {
+      const sel = q.group[t.id] ?? null
+      const label = t.questions ? activeGroupOf(t, sel) : null
+      if (t.questions && label !== null && label !== t.questions.open_group) wanted.add(label)
+    }
+    for (const label of wanted) await loadGroup($, label)
+    await reconcile($)
+    await notifyNew($, data)
+    await autoPass($)
+  } catch {
+    // Questions are an extra on the poll: a failure here never costs the status.
+  }
+}
+
+async function fetchStatus($: EngineInterface): Promise<StatusJson | null> {
+  const data = await fetchStatusOnce($)
+  if (data) await afterFetch($, data)
+  return data
 }
 
 async function isOpen($: EngineInterface) {
@@ -294,9 +543,28 @@ async function loadAi($: EngineInterface) {
   try {
     const stored = await $.store.get(AI_KEY)
     if (typeof stored === 'boolean') await update($, ai, () => stored)
+    const notified = await $.store.get(NOTIFY_KEY)
+    if (typeof notified === 'boolean') await update($, notify, () => notified)
   } catch {
-    // The default (on) stays.
+    // The defaults stay: AI summaries on, notifications off.
   }
+}
+
+async function toggleNotify($: EngineInterface) {
+  const next = (await read($, notify)) !== true
+  await update($, notify, () => next)
+  try {
+    await $.store.set(NOTIFY_KEY, next)
+  } catch {
+    // This session keeps it.
+  }
+}
+
+async function toggleAuto($: EngineInterface) {
+  const next = (await read($, auto)) !== true
+  await update($, auto, () => next)
+  autoFailed.clear()
+  if (next) await autoPass($)
 }
 
 async function toggleAi($: EngineInterface) {
@@ -313,6 +581,90 @@ async function clearAsk($: EngineInterface) {
   askStop?.abort()
   askStop = null
   await update($, ask, () => IDLE)
+}
+
+// What the person's presses do. Each reads the state afresh: a press never trusts what the last draw showed.
+
+const draftOf = (all: Drafts, taskId: string, qid: string): Draft | undefined => all[taskId]?.[qid]
+
+async function viewNow($: EngineInterface, t: StatusTask) {
+  return viewOf(t, await readQ($), await draftsOf($))
+}
+
+async function chooseOption($: EngineInterface, taskId: string, qid: string, label: string) {
+  await writeDrafts($, all => withDraft(all, taskId, qid, { pick: label, custom: null, confirmed: false }))
+}
+
+async function typeAnswer($: EngineInterface, taskId: string, qid: string, text: string) {
+  const custom = text.trim() || null
+  await writeDrafts($, all => withDraft(all, taskId, qid, { custom, confirmed: false }))
+}
+
+// Next: the open question's answer counts from here (a pick before Next is only a draft), and the next one opens.
+async function confirmQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion, move: boolean) {
+  const v = await viewNow($, t)
+  const d = draftOf(await draftsOf($), t.id, q.id)
+  const answer = answerOf(q, d)
+  if (answer === null) return
+  await writeDrafts($, all => withDraft(all, t.id, q.id, { confirmed: true, skipped: false, answer, pick: d?.pick ?? null, group: v.label }))
+  if (move) await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+}
+
+async function skipQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
+  const v = await viewNow($, t)
+  await writeDrafts($, all => withDraft(all, t.id, q.id, { skipped: true, group: v.label }))
+  await setQ($, t.id, { current: nextInQueue(v.order, (await draftsOf($))[t.id], q.id) })
+}
+
+// A row of the queue: open it for editing (a confirmed one goes back to being a draft).
+async function openQuestion($: EngineInterface, t: StatusTask, q: StatusQuestion) {
+  await writeDrafts($, all => (draftOf(all, t.id, q.id) ? withDraft(all, t.id, q.id, { confirmed: false, skipped: false }) : all))
+  await setQ($, t.id, { current: q.id })
+}
+
+// A group's header: it becomes the open group, its skipped questions come back, its other questions are fetched.
+async function openGroup($: EngineInterface, t: StatusTask, label: string) {
+  await writeDrafts($, all => ({
+    ...all,
+    [t.id]: Object.fromEntries(Object.entries(all[t.id] ?? {}).map(([id, d]) => [id, (d.group ?? UNGROUPED) === label ? { ...d, skipped: false } : d])),
+  }))
+  await setQ($, t.id, { group: label, current: null })
+  if (label !== t.questions?.open_group) await loadGroup($, label)
+  await reconcile($)
+}
+
+// Accept recommended: confirms the open group's reversible questions that have a recommendation. A critical one is left.
+async function acceptGroup($: EngineInterface, t: StatusTask) {
+  const v = await viewNow($, t)
+  const take = v.list.filter(q => acceptable(q, v.mine))
+  if (take.length === 0) return
+  await writeDrafts($, all => take.reduce((acc, q) => {
+    const rec = recommendedOf(q)?.label ?? null
+    return withDraft(acc, t.id, q.id, { pick: rec, custom: null, confirmed: true, skipped: false, answer: rec, group: v.label })
+  }, all))
+  await setQ($, t.id, { current: null })
+  await reconcile($)
+}
+
+// Send: every confirmed answer of the task, in one `orch answers`; on success, one wake. A failure keeps the drafts.
+async function sendTask($: EngineInterface, t: StatusTask, last?: StatusQuestion) {
+  if ((await readQ($)).sending[t.id]) return
+  if (last) await confirmQuestion($, t, last, false)
+  const pairs = confirmedOf((await draftsOf($))[t.id]).flatMap(([id, d]): [string, string][] => (d.answer ? [[id, d.answer]] : []))
+  if (pairs.length === 0) return
+  await setQ($, t.id, { sending: true, error: null })
+  const r = await runAnswers($, t.id, pairs, false)
+  if (!r.ok) {
+    const stale = r.stale
+    if (stale) await writeDrafts($, all => withoutDrafts(all, t.id, [stale]))
+    await setQ($, t.id, { sending: false, error: stale ? `${r.error}. The draft for ${stale} was dropped; send again.` : r.error })
+    return
+  }
+  await writeDrafts($, all => withoutDrafts(all, t.id, pairs.map(p => p[0])))
+  const woke = await wake($)
+  await setQ($, t.id, { sending: false, error: woke ? `The answers are saved; the agent could not be woken: ${woke}` : null })
+  await fetchStatus($)
+  $.ui.toast(`${plural(pairs.length, 'answer')} sent${woke ? '' : ', agent woken'}`)
 }
 
 // -- drawing helpers -----------------------------------------------------------------------------
@@ -364,7 +716,13 @@ export const register: Register = on => {
     })
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
     $.clock.every(SPIN_MS, () => void spinIfRunning($))
+    // A reload starts from a clean slate: what the poll saw last, and the auto-answers that failed.
+    lastOpen.clear()
+    autoFailed.clear()
+    autoDone.clear()
+    autoBusy = false
     void loadAi($)
+    void loadDrafts($)
     void (async () => {
       const data = await fetchStatus($)
       if (data?.tasks.some(t => t.in_cwd) && !(await read($, dismissed))) {
@@ -414,6 +772,13 @@ export const register: Register = on => {
     const storedTab = await read($, tab)
     const openTab = storedTab === 'history' || storedTab === 'ask' || storedTab === 'more' ? storedTab : null
     const aiOn = (await read($, ai)) !== false
+    const autoOn = (await read($, auto)) === true
+    const notifyOn = (await read($, notify)) === true
+    const qs = await readQ($)
+    const stored = await read($, drafts)
+    const ds: Drafts = stored && typeof stored.byTask === 'object' && stored.byTask ? stored.byTask : {}
+    const storedHist = await read($, hist)
+    const search = { query: typeof storedHist?.query === 'string' ? storedHist.query : '', page: typeof storedHist?.page === 'number' ? storedHist.page : 0 }
     const tick = await read($, frame)
     const spin = SPINNER[tick % SPINNER.length]
     const now = snap.fetchedAt
@@ -699,6 +1064,159 @@ export const register: Register = on => {
       ])
     }
 
+    // The Needs you panel of a task: one open question at a time, its group's queue, and Send. Only a confirmed
+    // answer (Next, or Accept) is sent; the typed or picked one before that is a draft.
+    const needsYou = (t: StatusTask) => {
+      const qq = t.questions
+      if (!qq || qq.counts.open === 0) return null
+      const v = viewOf(t, qs, ds)
+      const foldKey = `needs:${t.id}`
+      const folded = isExpanded(foldKey)
+      const pending = qq.counts.open
+      const confirmedAll = confirmedOf(v.mine).length
+      const stay = pending - confirmedAll
+      const grouped = qq.groups.some(g => g.group !== null && g.counts.open > 0)
+      const sending = qs.sending[t.id] === true
+      const err = qs.error[t.id]
+      const title = head(
+        <Button key={`needs-fold:${t.id}`} plain onPress={toggle(foldKey)}>
+          <Text color="subtle">{folded ? '▸ ' : '▾ '}</Text>
+          <Text bold color="warning">? Needs you</Text>
+        </Button>,
+        <Text dimColor>{`${pending} pending`}</Text>,
+      )
+      if (folded) return panel([title], 'warning')
+
+      const label = (q: StatusQuestion) => clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 4)
+      const optionRows = (q: StatusQuestion) => {
+        const picked = pickedLabel(q, v.mine[q.id])
+        return q.options.map((o, i) => {
+          const selected = picked === o.label
+          return (
+            <Box flexDirection="column" marginTop={1}>
+              <Button key={`${t.id}:${q.id}:o${i}`} plain onPress={() => chooseOption($, t.id, q.id, o.label)}>
+                <Text color={selected ? 'suggestion' : undefined}>{selected ? '● ' : '○ '}</Text>
+                <Text bold={selected ? true : undefined}>{o.label}</Text>
+                {o.recommended ? <Text dimColor> · Recommended</Text> : null}
+              </Button>
+              <Box paddingLeft={2}><Text dimColor>{optionNote(o)}</Text></Box>
+            </Box>
+          )
+        })
+      }
+
+      const questionOpen = (q: StatusQuestion) => {
+        const d = v.mine[q.id]
+        const answer = answerOf(q, d)
+        const ready = answer !== null
+        const others = nextInQueue(v.order, v.mine, q.id)
+        const count = confirmedAll + (ready ? 1 : 0)
+        const critical = isCritical(q)
+        return (
+          <Box flexDirection="column" paddingLeft={2} marginTop={1}>
+            <Text>{q.text}</Text>
+            <Text color={critical ? 'warning' : undefined} dimColor={critical ? undefined : true}>{metaText(q)}</Text>
+            {hasOptions(q)
+              ? optionRows(q)
+              : <Box marginTop={1}><Text dimColor>The options load once the answers so far are sent.</Text></Box>}
+            {Input ? (
+              <Box marginTop={1}>
+                <Input key={`${t.id}:${q.id}:own`} placeholder="Or type your own answer…" submitLabel="use"
+                  value={d?.custom ?? undefined} onSubmit={value => typeAnswer($, t.id, q.id, value)} />
+              </Box>
+            ) : null}
+            {d?.custom ? <Text color="suggestion">{`● Your answer: ${d.custom}`}</Text> : null}
+            <Box flexDirection="row" marginTop={1} columnGap={2}>
+              {!ready
+                ? <Text color="warning">Choose an option first</Text>
+                : others === null
+                  ? <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t, q)}>{`Send ${plural(count, 'answer')}`}</Button>
+                  : <Button key={`next:${t.id}`} variant="primary" onPress={() => confirmQuestion($, t, q, true)}>Next</Button>}
+              {others !== null ? <Button key={`skip:${t.id}`} onPress={() => skipQuestion($, t, q)}>Skip for now</Button> : null}
+              {ready && others === null ? <Text dimColor>{isRunning(t) ? 'agent keeps working' : 'wakes the agent'}</Text> : null}
+            </Box>
+          </Box>
+        )
+      }
+
+      const rowFor = (q: StatusQuestion) => {
+        const d = v.mine[q.id]
+        const isCurrent = v.current?.id === q.id
+        const mark = d?.confirmed ? '✓ ' : isCurrent ? '▾ ' : '▸ '
+        return (
+          <Button key={`row:${t.id}:${q.id}`} plain onPress={() => openQuestion($, t, q)}>
+            <Text color={d?.confirmed ? 'success' : 'subtle'}>{mark}</Text>
+            <Text bold={isCurrent ? true : undefined}>{label(q)}</Text>
+            {d?.skipped && !d.confirmed ? <Text dimColor>  skipped</Text> : null}
+            {d?.confirmed ? <Text dimColor>{clip(`  → ${d.answer ?? ''}`, 24)}</Text> : null}
+          </Button>
+        )
+      }
+
+      // The open group's queue: every row when it is short, else the open question, the next one and a count.
+      const queue = v.order.flatMap(id => v.byId.get(id) ?? [])
+      const waiting = queue.filter(q => !v.mine[q.id]?.confirmed && !v.mine[q.id]?.skipped && q.id !== v.current?.id)
+      const queueRows = () => {
+        if (!grouped && queue.length <= ROWS_SHOWN) {
+          return queue.map(q => (
+            <Box flexDirection="column" marginTop={1}>
+              {rowFor(q)}
+              {v.current?.id === q.id ? questionOpen(q) : null}
+            </Box>
+          ))
+        }
+        const cur = v.current
+        return [
+          cur ? <Box flexDirection="column" marginTop={1}><Text bold><Text color="subtle">▾ </Text>{label(cur)}</Text>{questionOpen(cur)}</Box> : null,
+          ...waiting.slice(0, 1).map(q => <Box marginTop={1}>{rowFor(q)}</Box>),
+          waiting.length > 1 ? <Text dimColor>{`· ${waiting.length - 1} more`}</Text> : null,
+        ]
+      }
+
+      const groupRows = () => qq.groups.filter(g => g.counts.open > 0).map(g => {
+        const mine = Object.values(v.mine).filter(d => (d.group ?? UNGROUPED) === g.label)
+        const ready = mine.filter(d => d.confirmed).length
+        const skipped = mine.filter(d => d.skipped && !d.confirmed).length
+        const isActive = g.label === v.label
+        const right = [`${g.counts.open - ready} left`, skipped ? `${skipped} skipped` : null, ready ? `${ready} ready` : null].filter(Boolean).join(' · ')
+        return (
+          <Box flexDirection="column" marginTop={1}>
+            {head(
+              <Button key={`group:${t.id}:${g.label}`} plain onPress={() => openGroup($, t, g.label)}>
+                <Text color="subtle">{isActive ? '▾ ' : '▸ '}</Text>
+                <Text bold={isActive ? true : undefined}>{clip(g.label, Math.max(8, room - right.length - 6))}</Text>
+              </Button>,
+              <Text dimColor>{right}</Text>,
+            )}
+            {isActive ? <Box flexDirection="column" paddingLeft={2}>{queueRows()}</Box> : null}
+          </Box>
+        )
+      })
+
+      const sent = qq.counts.answered + qq.counts.assumed
+      const canAccept = v.list.filter(q => acceptable(q, v.mine)).length
+      const acceptText = grouped ? `Accept recommended in ${v.label ?? ''} (${canAccept})` : `Accept all recommended (${canAccept})`
+      const sendText = stay > 0 ? `Send ${confirmedAll} now · ${stay} stay open` : `Send ${plural(confirmedAll, 'answer')}`
+      return panel([
+        title,
+        ...(grouped
+          ? [blank, <Text>{'█'.repeat(barCells((sent / Math.max(1, sent + pending)) * 100, 16))}<Text dimColor>{'░'.repeat(16 - barCells((sent / Math.max(1, sent + pending)) * 100, 16))}{`  ${sent} of ${sent + pending} sent`}</Text></Text>, ...groupRows()]
+          : queueRows()),
+        v.current === null && confirmedAll > 0
+          ? <Box marginTop={1} flexDirection="row" columnGap={2}>
+              <Button key={`send:${t.id}`} variant="primary" onPress={() => sendTask($, t)}>{`Send ${plural(confirmedAll, 'answer')}`}</Button>
+              <Text dimColor>{stay > 0 ? `${stay} stay open` : isRunning(t) ? 'agent keeps working' : 'wakes the agent'}</Text>
+            </Box>
+          : null,
+        canAccept > 0 ? <Box marginTop={1}><Button key={`accept:${t.id}`} plain onPress={() => acceptGroup($, t)}><Text dimColor>{acceptText}</Text></Button></Box> : null,
+        confirmedAll > 0 && v.current !== null
+          ? <Box marginTop={1}><Button key={`send-now:${t.id}`} plain onPress={() => sendTask($, t)}><Text dimColor>{sendText}</Text></Button></Box>
+          : null,
+        sending ? <Text color="claude">{`${spin} sending…`}</Text> : null,
+        err ? <Text color="warning">{clip(err, room * 2)}</Text> : null,
+      ], 'warning')
+    }
+
     // Milestones and the current milestone's steps, folded around the current item.
     const workPanel = (t: StatusTask) => {
       const milestones = t.milestones?.items ?? []
@@ -722,7 +1240,7 @@ export const register: Register = on => {
 
     const taskBlock = (t: StatusTask, index: number) => {
       const key = `task:${t.id}`
-      if (taskOpen(t)) return <Box flexDirection="column">{card(t, key)}{workPanel(t)}</Box>
+      if (taskOpen(t)) return <Box flexDirection="column">{card(t, key)}{needsYou(t)}{workPanel(t)}</Box>
       // Folded tasks stack tight.
       const prev = tasks[index - 1]
       const gap = index === 0 || (prev && taskOpen(prev)) ? 1 : 0
@@ -752,11 +1270,28 @@ export const register: Register = on => {
     const primary = tasks.find(taskOpen) ?? tasks[0]
 
     const historyTab = () => {
-      const answered = (primary?.questions?.history ?? []).filter(q => q.status === 'answered' || q.status === 'assumed')
-      if (answered.length === 0) return [<Text dimColor>No answered questions yet.</Text>]
-      return answered.slice(0, HISTORY_SHOWN).map(q => {
+      const all = historyRows(primary?.questions?.history ?? [], '')
+      const found = historyRows(primary?.questions?.history ?? [], search.query)
+      const pages = pageCount(found.length)
+      const page = Math.min(search.page, pages - 1)
+      const finder = Input && (all.length > HISTORY_PAGE || search.query) ? (
+        <Box marginBottom={1}>
+          <Input key="hist-search" placeholder="Search answered questions…" submitLabel="search" value={search.query}
+            onSubmit={value => update($, hist, () => ({ query: value.trim(), page: 0 }))} />
+        </Box>
+      ) : null
+      if (found.length === 0) return [finder, <Text dimColor>{search.query ? 'No matching questions.' : 'No answered questions yet.'}</Text>]
+      const go = (to: number) => update($, hist, h => ({ query: (h ?? search).query, page: to }))
+      const pager = pages > 1 ? (
+        <Box flexDirection="row" columnGap={2} marginTop={1}>
+          {page > 0 ? <Button key="hist-prev" plain onPress={() => go(page - 1)}><Text dimColor>‹ Newer</Text></Button> : null}
+          <Text dimColor>{`Page ${page + 1} of ${pages}`}</Text>
+          {page < pages - 1 ? <Button key="hist-next" plain onPress={() => go(page + 1)}><Text dimColor>Older ›</Text></Button> : null}
+        </Box>
+      ) : null
+      const rows = found.slice(page * HISTORY_PAGE, (page + 1) * HISTORY_PAGE).map(q => {
         const key = `hist:${q.id}`
-        const auto = q.status === 'assumed'
+        const auto_ = q.status === 'assumed'
         return (
           <Box flexDirection="column">
             {head(
@@ -764,18 +1299,19 @@ export const register: Register = on => {
                 <Text color="subtle">{isExpanded(key) ? '▾ ' : '▸ '}</Text>
                 {clip(`Question ${q.n}: ${q.topic ?? q.text}`, room - 14)}
               </Button>,
-              auto ? <Text color="permission">◆ Auto</Text> : <Text color="success">✓ Answered</Text>,
+              auto_ ? <Text color="permission">◆ Auto</Text> : <Text color="success">✓ Answered</Text>,
             )}
             {isExpanded(key) ? (
               <Box flexDirection="column" paddingLeft={2} marginBottom={1}>
                 {mdLite(q.text, room - 2).map(mdRow)}
                 <Text color="suggestion">{`→ ${q.answer ?? ''}`}</Text>
-                <Text dimColor>{q.answered ?? ''}</Text>
+                <Text dimColor>{[q.group, q.answered].filter(Boolean).join(' · ')}</Text>
               </Box>
             ) : null}
           </Box>
         )
       })
+      return [finder, ...rows, pager]
     }
 
     const askTab = () => {
@@ -844,6 +1380,8 @@ export const register: Register = on => {
         subhead('Advanced options'),
         blank,
         check('opt-ai', aiOn, 'AI summaries: goal, milestones, steps', 'off shows the original text', () => toggleAi($)),
+        check('opt-auto', autoOn, 'Auto-answer with recommended', 'reversible questions only; History shows ◆ Auto', () => toggleAuto($)),
+        check('opt-notify', notifyOn, 'Notify me when a question arrives', null, () => toggleNotify($)),
         ...(snap.about
           ? [
               subhead('About'),

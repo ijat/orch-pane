@@ -1,5 +1,5 @@
 // Pure logic of the pane: no `$`, no JSX. register.tsx draws with it; the tests call it directly.
-import type { IndexStatus, StatusRole, StatusTask } from '../types'
+import type { Draft, IndexStatus, StatusOption, StatusQuestion, StatusRole, StatusTask } from '../types'
 
 // -- small text helpers ---------------------------------------------------------------------------
 
@@ -531,6 +531,134 @@ export function shimmer(filled: number, frame: number, palette: Palette = GREEN)
     const glow = Math.max(0, 1 - Math.abs(i - pos) / RADIUS)
     return hex(mix(base, palette.glow, glow * 0.85))
   })
+}
+
+// -- questions ------------------------------------------------------------------------------------
+
+// The text a wake sends: fixed, no answer in it. The agent reads the answers with `orch`.
+export const WAKE_TEXT =
+  'orch-pane: the user answered parked questions. Read the answers with `orch status --json` (the questions block, history) or the task\'s questions.md, then carry on.'
+
+export const NO_DRAFT: Draft = { pick: null, custom: null, confirmed: false, skipped: false, group: null, answer: null }
+
+// A question that cannot be undone: nothing is preselected for it, and Accept and auto-answer leave it alone.
+export const isCritical = (q: StatusQuestion) => q.reversible === 'no'
+
+export const recommendedOf = (q: StatusQuestion): StatusOption | undefined => q.options.find(o => o.recommended)
+
+// Whether the entry carries its options. `compact` and `minimal` entries (a long list's tail) do not.
+export const hasOptions = (q: StatusQuestion) => (q.detail ?? 'full') === 'full'
+
+// What Next would record: the typed text, else the picked option, else the recommended one (never for a critical question).
+export function answerOf(q: StatusQuestion, d: Draft | undefined): string | null {
+  const typed = d?.custom?.trim()
+  if (typed) return typed
+  if (d?.pick && q.options.some(o => o.label === d.pick)) return d.pick
+  if (isCritical(q)) return null
+  return recommendedOf(q)?.label ?? null
+}
+
+// The option that shows as chosen: none when a typed answer is in use.
+export function pickedLabel(q: StatusQuestion, d: Draft | undefined): string | null {
+  if (d?.custom?.trim()) return null
+  return answerOf(q, d)
+}
+
+// An option's line under its label: its explanation, else the stated reason it has none.
+export const optionNote = (o: StatusOption) =>
+  o.kind === 'explanation' && o.text ? o.text : `No explanation: ${o.text ?? 'not given'}`
+
+// "blocks step 5 · can be changed later".
+export function metaText(q: StatusQuestion): string {
+  const b = (q.blocks ?? 'all').trim().toLowerCase()
+  const blocks = b === 'all' || b === '' ? 'blocks everything' : b === 'none' ? 'blocks nothing' : `blocks step ${q.blocks}`
+  const rev = q.reversible === 'yes' ? 'can be changed later' : q.reversible === 'no' ? 'cannot be undone' : 'may not be undoable'
+  return `${blocks} · ${rev}`
+}
+
+// The queue's order: questions still open keep the place they joined at; new ones go to the end, in data order.
+export function mergeOrder(prev: readonly string[] | undefined, open: readonly string[]): string[] {
+  const still = new Set(open)
+  const kept = (prev ?? []).filter(id => still.has(id))
+  const have = new Set(kept)
+  return [...kept, ...open.filter(id => !have.has(id))]
+}
+
+// The next question to ask after `from`: open, not confirmed, not skipped; the rest of the queue first, then the start.
+export function nextInQueue(order: readonly string[], drafts: Record<string, Draft> | undefined, from: string | null): string | null {
+  const ok = (id: string) => id !== from && !drafts?.[id]?.confirmed && !drafts?.[id]?.skipped
+  const at = from === null ? -1 : order.indexOf(from)
+  return order.slice(at + 1).find(ok) ?? order.slice(0, Math.max(0, at)).find(ok) ?? null
+}
+
+// `orch answers` argv for one task: every answer an element of its own, after `--` so none reads as a flag.
+export function answersArgv(windows: boolean, orch: string, taskId: string, pairs: readonly [string, string][], auto: boolean): string[] {
+  return [
+    ...(windows ? ['python'] : []), orch, 'answers', '-t', taskId, ...(auto ? ['--auto', '--as', 'orch-pane'] : []),
+    '--', ...pairs.flatMap(([id, text]) => [id, text]),
+  ]
+}
+
+// "Q3 is answered, not open; nothing written" names a draft that went stale; "no question Q3" too.
+export function staleQuestion(stderr: string): string | null {
+  const m = /\b(Q\d+) is \w+, not open|no question (Q\d+)/.exec(stderr)
+  return m ? (m[1] ?? m[2] ?? null) : null
+}
+
+// Open questions an auto-answer may take: reversible, a recommendation to take, options loaded, no draft of the person's.
+export function autoPairs(open: readonly StatusQuestion[], drafts: Record<string, Draft> | undefined): [string, string][] {
+  return open.flatMap((q): [string, string][] => {
+    const rec = recommendedOf(q)
+    const d = drafts?.[q.id]
+    const touched = d && (d.confirmed || d.pick !== null || d.custom !== null || d.skipped)
+    return q.status === 'open' && q.reversible === 'yes' && hasOptions(q) && rec && !touched ? [[q.id, rec.label]] : []
+  })
+}
+
+// Questions Accept would confirm: open, not critical, with a recommendation, not already confirmed.
+export const acceptable = (q: StatusQuestion, drafts: Record<string, Draft> | undefined) =>
+  q.status === 'open' && !isCritical(q) && hasOptions(q) && recommendedOf(q) !== undefined && !drafts?.[q.id]?.confirmed
+
+export const confirmedOf = (drafts: Record<string, Draft> | undefined) =>
+  Object.entries(drafts ?? {}).filter(([, d]) => d.confirmed && d.answer)
+
+export const HISTORY_PAGE = 10
+
+// Answered and assumed questions matching a search (topic, text, group and answer), in the given order.
+export function historyRows(history: readonly StatusQuestion[], needle: string): StatusQuestion[] {
+  const n = needle.trim().toLowerCase()
+  return history
+    .filter(q => q.status === 'answered' || q.status === 'assumed')
+    .filter(q => !n || `${q.topic ?? ''} ${q.text} ${q.group ?? ''} ${q.answer ?? ''}`.toLowerCase().includes(n))
+}
+
+export const pageCount = (n: number, size = HISTORY_PAGE) => Math.max(1, Math.ceil(n / size))
+
+export const groupKey = (taskId: string, group: string) => `${taskId}\n${group}`
+
+// What `orch status --json` calls the questions that have no group.
+export const UNGROUPED = '(ungrouped)'
+
+// The group being answered: the one the person picked while it still has open questions, else the data's first.
+export function activeGroupOf(t: StatusTask, picked: string | null): string | null {
+  const qq = t.questions
+  if (!qq) return null
+  const open = (label: string) => qq.groups.some(g => g.label === label && g.counts.open > 0)
+  return picked !== null && open(picked) ? picked : qq.open_group
+}
+
+// The active group's open questions in full: the status block's own, or the ones fetched for that group.
+export function openListOf(t: StatusTask, picked: string | null, fetched: Record<string, StatusQuestion[]>): StatusQuestion[] {
+  const qq = t.questions
+  const label = activeGroupOf(t, picked)
+  if (!qq || label === null) return []
+  return label === qq.open_group ? qq.open : fetched[groupKey(t.id, label)] ?? []
+}
+
+// The open question: the wanted one while it is not confirmed, else the first still to ask.
+export function pickCurrent(order: readonly string[], drafts: Record<string, Draft> | undefined, wanted: string | null): string | null {
+  if (wanted !== null && order.includes(wanted) && !drafts?.[wanted]?.confirmed) return wanted
+  return nextInQueue(order, drafts, null)
 }
 
 // -- model helpers --------------------------------------------------------------------------------

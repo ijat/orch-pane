@@ -6,9 +6,11 @@ import {
   agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, countTail, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
   sortByAttention, spawnOf, sparkline, stepsTail, textKey,
+  WAKE_TEXT, acceptable, answerOf, answersArgv, autoPairs, historyRows, isCritical, mergeOrder, metaText, nextInQueue, optionNote,
+  pageCount, pickCurrent, pickedLabel, staleQuestion,
 } from '../hooks/lib'
 import type { ItemState, MdLine } from '../hooks/lib'
-import type { IndexStatus, StatusRole, StatusTask } from '../types'
+import type { Draft, IndexStatus, StatusQuestion, StatusRole, StatusTask } from '../types'
 
 const NOW = Date.parse('2026-10-29T10:30Z')
 
@@ -66,7 +68,14 @@ const OTHER = {
 const OUTPUT = JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: '/proj', tasks: [PROGRAM, OTHER] })
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
-type World = { runs: string[][]; indexRuns: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran; index: Ran }
+type World = {
+  runs: string[][]; indexRuns: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran; index: Ran
+  // `orch answers` runs (its argv), its answer, and what the orch would then print for `status`.
+  answers: string[][]; answered: Ran; onAnswers: (argv: string[]) => void
+  // `orch status --question-group <label>`: the stdout to give by label, and the runs.
+  groups: Record<string, string>; groupRuns: string[][]
+  wakes: string[]; notes: string[]
+}
 
 const INDEX: IndexStatus = {
   schema: 1, state: 'stale', indexing: false, indexed_commit: '2a465daf7c7c8793', head_commit: 'd5eb5b06fbd77be7',
@@ -89,7 +98,10 @@ const INDEX_RAN: Ran = { exitCode: 0, stdout: JSON.stringify(INDEX), stderr: '' 
 // `env` replaces the environment.
 function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' },
                env: Record<string, string> = { HOME: '/home/u' }): World {
-  const w: World = { runs: [], indexRuns: [], opens: 0, paneOpen: true, placed: true, result, index: INDEX_RAN }
+  const w: World = {
+    runs: [], indexRuns: [], opens: 0, paneOpen: true, placed: true, result, index: INDEX_RAN,
+    answers: [], answered: { exitCode: 0, stdout: 'Q1 answered', stderr: '' }, onAnswers: () => {}, groups: {}, groupRuns: [], wakes: [], notes: [],
+  }
   mock.env(on, env)
   on('session.cwd', () => ({ value: '/proj' }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
@@ -111,12 +123,32 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
         : e.argv[0]?.includes('orch-index') ? 'orch-index 0.2.0' : 'orch 0.1.0'
       return { value: { exitCode: 0, stdout: out, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
     }
+    if (e.argv.includes('answers')) {
+      w.answers.push([...e.argv])
+      if (w.answered.exitCode === 0) w.onAnswers([...e.argv])
+      return { value: { ...w.answered, isStdoutTruncated: false, isStderrTruncated: false } }
+    }
+    const group = e.argv.indexOf('--question-group')
+    if (group >= 0) {
+      w.groupRuns.push([...e.argv])
+      const out = w.groups[e.argv[group + 1] ?? '']
+      return { value: { exitCode: out === undefined ? 1 : 0, stdout: out ?? '', stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    }
     const isIndex = e.argv.some(a => /orch-index(\.exe)?$/.test(a))
     ;(isIndex ? w.indexRuns : w.runs).push([...e.argv])
     const ran = isIndex ? w.index : w.result
     return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.complete', () => ({ text: '' }))
+  on('prompt.submit', (_, e) => {
+    w.wakes.push(e.text)
+    return { text: e.text }
+  })
+  on('ui.notify', (_, e) => {
+    w.notes.push(e.text)
+    return { value: { isSent: true as const, channel: 'kitty' as const } }
+  })
+  on('ui.toast', () => ({ value: undefined }))
   return w
 }
 
@@ -1346,4 +1378,486 @@ test('askContext sends only the question counts, not the questions', () => {
   const sent = JSON.parse(askContext([t]))[0]
   expect(sent.questions).toEqual({ counts })
   expect(JSON.parse(askContext([task({})]))[0].questions).toBeUndefined()
+})
+
+// -- answering: Needs you, groups, Next/Send, drafts, auto-answer, notify, History ------------------------
+
+const UNG = '(ungrouped)'
+const qopt = (label: string, text: string, recommended = false, kind: string | null = 'explanation') => ({ label, text, kind, recommended })
+const mkq = (n: number, over: Partial<StatusQuestion> & Record<string, unknown> = {}): StatusQuestion => ({
+  id: `Q${n}`, n, status: 'open', text: `Should item ${n} change?`, topic: `Item ${n}`, group: null, reversible: 'yes', blocks: 'none',
+  asked_by: 'orchestrator', asked: '2026-10-29T10:00Z',
+  options: [qopt('Keep', 'Nothing changes for you.', true), qopt('Change', 'Uses the new behaviour.')],
+  answer: null, answered: null, detail: 'full', ...over,
+}) as StatusQuestion
+const critical = (n: number) => mkq(n, {
+  reversible: 'no', text: `Delete item ${n} for good?`, topic: `Delete ${n}`,
+  options: [qopt('Delete', 'The item is gone for good.'), qopt('Keep it', 'Nothing is lost.')],
+})
+const labelOf = (q: StatusQuestion) => q.group ?? UNG
+const counts = (open: number, answered = 0, assumed = 0) => ({ open, answered, assumed, withdrawn: 0 })
+
+// The questions block as `orch status --json` prints it: the first group's open questions in full, the others by count.
+function qblock(open: StatusQuestion[], history: StatusQuestion[] = [], answered = 0) {
+  const labels = [...new Set(open.map(labelOf))]
+  return {
+    counts: counts(open.length, answered),
+    groups: labels.map(l => ({ group: l === UNG ? null : l, label: l, counts: counts(open.filter(q => labelOf(q) === l).length) })),
+    open_group: labels[0] ?? null,
+    open: labels[0] === undefined ? [] : open.filter(q => labelOf(q) === labels[0]),
+    history, history_total: history.length,
+  }
+}
+const withQs = (t: object, open: StatusQuestion[], history: StatusQuestion[] = [], answered = 0) =>
+  ({ ...t, questions_open: open.length, questions: qblock(open, history, answered) })
+const ORCH = '/home/u/.claude/bin/orch'
+
+async function pane($: Engine, on: On, tasks: object[], seed: Record<string, unknown> = {}) {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: output(...tasks), stderr: '' })
+  const store = memStore(on, seed)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  return { clock, w, store, ui }
+}
+type Ui = Awaited<ReturnType<typeof pane>>['ui']
+const buttonText = async (ui: Ui, key: string) => (await ui.find({ type: 'Button', key }))?.text
+const buttons = async (ui: Ui) => (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '')
+
+test('Needs you: one open question, the recommended option preselected, every option explained', async ($, on) => {
+  const reasoned = mkq(2, { options: [qopt('Keep', 'Nothing changes for you.', true), qopt('Change', 'Obvious from the name alone.', false, 'reason')] })
+  const { ui } = await pane($, on, [withQs(PROGRAM, [mkq(1), reasoned, critical(3)])])
+  const text = await allText(ui)
+  expect(text).toContain('? Needs you')
+  expect(text).toContain('3 pending')
+  expect(text).toContain('Should item 1 change?')
+  expect(text).toContain('blocks nothing · can be changed later')
+  expect(text).toContain('Nothing changes for you.')
+  expect(text).toContain('Uses the new behaviour.')
+  expect(text).toContain('Recommended')
+  // Only the open question shows its options; the others are rows.
+  expect(text).not.toContain('Should item 2 change?')
+  expect((await buttonText(ui, 'app/build:Q1:o0'))).toMatch(/^● Keep · Recommended$/)
+  expect((await buttonText(ui, 'app/build:Q1:o1'))).toMatch(/^○ Change$/)
+  await ui.press({ key: 'next:app/build' })
+  expect(await allText(ui)).toContain('No explanation: Obvious from the name alone.')
+  await ui.unmount()
+})
+
+test('Next moves on, a critical question has nothing preselected, the last one sends the batch and wakes once', async ($, on) => {
+  const { ui, w, store } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2), critical(3)])])
+  w.onAnswers = () => { w.result = { exitCode: 0, stdout: output(PROGRAM), stderr: '' } }
+  expect(await buttonText(ui, 'next:app/build')).toBe('Next')
+  await ui.press({ key: 'next:app/build' })
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  await ui.press({ key: 'next:app/build' })
+
+  // Question 3 is critical: no option is chosen, so there is no Send yet.
+  expect(await allText(ui)).toContain('Delete item 3 for good?')
+  expect(await allText(ui)).toContain('blocks nothing · cannot be undone')
+  expect(await allText(ui)).toContain('Choose an option first')
+  expect(await buttonText(ui, 'send:app/build')).toBeUndefined()
+  expect(await buttonText(ui, 'next:app/build')).toBeUndefined()
+  expect(await buttonText(ui, 'app/build:Q3:o0')).toBe('○ Delete')
+  expect(await buttonText(ui, 'app/build:Q3:o1')).toBe('○ Keep it')
+  expect(w.answers).toEqual([])
+
+  await ui.press({ key: 'app/build:Q3:o1' })
+  expect(await buttonText(ui, 'send:app/build')).toBe('Send 3 answers')
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Keep', 'Q2', 'Keep', 'Q3', 'Keep it']])
+  expect(w.wakes).toEqual([WAKE_TEXT])
+  expect(w.wakes[0]).not.toContain('Keep')
+  expect(await allText(ui)).not.toContain('Needs you')
+  expect(store.get('drafts')).toEqual({})
+  await ui.unmount()
+})
+
+test('a pick counts only after Next; Send now sends the confirmed ones and the rest stay open', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2), mkq(3)])])
+  await ui.press({ key: 'app/build:Q1:o1' })
+  expect(await buttonText(ui, 'app/build:Q1:o1')).toBe('● Change')
+  expect(await buttonText(ui, 'send-now:app/build')).toBeUndefined()
+  await ui.press({ key: 'next:app/build' })
+  expect(await buttonText(ui, 'send-now:app/build')).toBe('Send 1 now · 2 stay open')
+  expect(await buttonText(ui, 'row:app/build:Q1')).toMatch(/^✓ Question 1: Item 1 {2}→ Change$/)
+  await ui.press({ key: 'send-now:app/build' })
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Change']])
+  expect(w.wakes).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('a failing orch answers wakes nobody, keeps the picks and shows the error', async ($, on) => {
+  const { ui, w, store } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  w.answered = { exitCode: 1, stdout: '', stderr: 'orch: boom\nmore' }
+  await ui.press({ key: 'app/build:Q1:o1' })
+  await ui.press({ key: 'next:app/build' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers).toHaveLength(1)
+  expect(w.wakes).toEqual([])
+  expect(await allText(ui)).toContain('orch answers failed: orch: boom')
+  expect(JSON.stringify(store.get('drafts'))).toContain('"Q1"')
+  expect(JSON.stringify(store.get('drafts'))).toContain('"Q2"')
+  // The drafts are still there: a second try with orch working sends both.
+  w.answered = { exitCode: 0, stdout: 'ok', stderr: '' }
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[1]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Change', 'Q2', 'Keep'])
+  expect(w.wakes).toEqual([WAKE_TEXT])
+  expect(await allText(ui)).not.toContain('orch answers failed')
+  await ui.unmount()
+})
+
+test('a draft for a question that was answered elsewhere is dropped on the refusal, the rest can go', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2), mkq(3)])])
+  await ui.press({ key: 'next:app/build' })
+  await ui.press({ key: 'next:app/build' })
+  w.answered = { exitCode: 1, stdout: '', stderr: 'orch: Q2 is answered, not open; nothing written' }
+  await ui.press({ key: 'send-now:app/build' })
+  expect(w.wakes).toEqual([])
+  expect(await allText(ui)).toContain('The draft for Q2 was dropped; send again.')
+  w.answered = { exitCode: 0, stdout: 'ok', stderr: '' }
+  await ui.press({ key: 'send-now:app/build' })
+  expect(w.answers[1]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Keep'])
+  await ui.unmount()
+})
+
+test('an answer travels as one argv element after `--`, never through a shell', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  const nasty = `x'; rm -rf / $(id) --flag "q" \`y\``
+  await ui.input({ key: 'app/build:Q1:own', text: nasty })
+  expect(await allText(ui)).toContain(`● Your answer: ${nasty}`)
+  await ui.press({ key: 'next:app/build' })
+  await ui.press({ key: 'send:app/build' })
+  const argv = w.answers[0] ?? []
+  expect(argv.slice(0, 5)).toEqual([ORCH, 'answers', '-t', 'app/build', '--'])
+  expect(argv.slice(5)).toEqual(['Q1', nasty, 'Q2', 'Keep'])
+  expect(w.wakes).toHaveLength(1)
+  await ui.unmount()
+})
+
+test('Accept confirms the recommended answers and leaves a critical question open', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2), critical(3), mkq(4, { options: [qopt('A', 'first'), qopt('B', 'second')] })])])
+  expect(await buttonText(ui, 'accept:app/build')).toBe('Accept all recommended (2)')
+  await ui.press({ key: 'accept:app/build' })
+  expect(w.answers).toEqual([])
+  expect(await buttonText(ui, 'row:app/build:Q1')).toMatch(/^✓ /)
+  expect(await buttonText(ui, 'row:app/build:Q2')).toMatch(/^✓ /)
+  expect(await buttonText(ui, 'row:app/build:Q3')).toMatch(/^▾ /)
+  expect(await allText(ui)).toContain('Delete item 3 for good?')
+  expect(await buttonText(ui, 'send-now:app/build')).toBe('Send 2 now · 2 stay open')
+  await ui.press({ key: 'send-now:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Keep', 'Q2', 'Keep'])
+  await ui.unmount()
+})
+
+test('Skip for now moves on and a skipped question comes back through its row', async ($, on) => {
+  const { ui } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  await ui.press({ key: 'skip:app/build' })
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  expect(await buttonText(ui, 'row:app/build:Q1')).toMatch(/skipped$/)
+  // Only one question is left to ask, so there is nothing to skip to.
+  expect(await buttonText(ui, 'skip:app/build')).toBeUndefined()
+  await ui.press({ key: 'row:app/build:Q1' })
+  expect(await allText(ui)).toContain('Should item 1 change?')
+  expect(await buttonText(ui, 'row:app/build:Q1')).not.toMatch(/skipped/)
+  await ui.unmount()
+})
+
+test('a poll keeps the draft and the open question, and a new question joins the end', async ($, on) => {
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  await ui.press({ key: 'app/build:Q1:o1' })
+  // Q9 arrives and sorts first in the data.
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(9), mkq(1), mkq(2)])), stderr: '' }
+  await clock.advance(8000)
+  expect(await allText(ui)).toContain('3 pending')
+  expect(await allText(ui)).toContain('Should item 1 change?')
+  expect(await buttonText(ui, 'app/build:Q1:o1')).toBe('● Change')
+  await ui.press({ key: 'next:app/build' })
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  await ui.press({ key: 'next:app/build' })
+  expect(await allText(ui)).toContain('Should item 9 change?')
+  await ui.unmount()
+})
+
+test('questions of another task are answered against that task', async ($, on) => {
+  const other = withQs({ ...OTHER, in_cwd: true }, [mkq(1)])
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1)]), other])
+  expect(await buttonText(ui, 'send:app/build')).toBe('Send 1 answer')
+  expect(await buttonText(ui, 'send:other/fix')).toBe('Send 1 answer')
+  await ui.press({ key: 'send:other/fix' })
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'other/fix', '--', 'Q1', 'Keep']])
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[1]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Keep'])
+  await ui.unmount()
+})
+
+test('the panel folds to its title', async ($, on) => {
+  const { ui } = await pane($, on, [withQs(PROGRAM, [mkq(1)])])
+  await ui.press({ key: 'needs-fold:app/build' })
+  expect(await allText(ui)).not.toContain('Should item 1 change?')
+  expect(await allText(ui)).toContain('1 pending')
+  await ui.press({ key: 'needs-fold:app/build' })
+  expect(await allText(ui)).toContain('Should item 1 change?')
+  await ui.unmount()
+})
+
+test('a question whose options were not loaded says so, and can still be answered in words', async ($, on) => {
+  const compact = mkq(1, { detail: 'compact', options: [] })
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [compact])])
+  expect(await allText(ui)).toContain('The options load once the answers so far are sent.')
+  expect(await allText(ui)).toContain('Choose an option first')
+  await ui.input({ key: 'app/build:Q1:own', text: 'my words' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'my words'])
+  await ui.unmount()
+})
+
+test('drafts survive a restart: they are read back from the store and sent', async ($, on) => {
+  const draft: Draft = { pick: 'Change', custom: null, confirmed: true, skipped: false, group: UNG, answer: 'Change' }
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])], { drafts: { 'app/build': { Q1: draft } } })
+  expect(await buttonText(ui, 'row:app/build:Q1')).toMatch(/^✓ Question 1/)
+  expect(await allText(ui)).toContain('Should item 2 change?')
+  expect(await buttonText(ui, 'send:app/build')).toBe('Send 2 answers')
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Change', 'Q2', 'Keep'])
+  await ui.unmount()
+})
+
+test('a draft of a question that is no longer open is dropped by the next poll', async ($, on) => {
+  const draft: Draft = { pick: 'Change', custom: null, confirmed: true, skipped: false, group: UNG, answer: 'Change' }
+  const { ui, w, clock, store } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])], { drafts: { 'app/build': { Q1: draft } } })
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(2)])), stderr: '' }
+  await clock.advance(8000)
+  expect(store.get('drafts')).toEqual({})
+  expect(await buttonText(ui, 'send:app/build')).toBe('Send 1 answer')
+  await ui.unmount()
+})
+
+// -- auto-answer ----------------------------------------------------------------------------------------
+
+test('Auto-answer is off until switched on, answers only reversible recommended questions, records Auto and wakes once', async ($, on) => {
+  const open = [
+    mkq(1), mkq(2), critical(3), mkq(4, { reversible: 'unknown' }), mkq(5, { options: [qopt('A', 'first'), qopt('B', 'second')] }),
+    mkq(6, { detail: 'minimal', options: [] }),
+  ]
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, open)])
+  await clock.advance(16000)
+  expect(w.answers).toEqual([])
+  expect(w.wakes).toEqual([])
+  const assumed = [mkq(1, { status: 'assumed', answer: 'Keep', answered: '2026-10-29T10:31Z' }), mkq(2, { status: 'assumed', answer: 'Keep', answered: '2026-10-29T10:31Z' })]
+  w.onAnswers = () => { w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, open.slice(2), assumed)), stderr: '' } }
+
+  await ui.press({ key: 'tab:more' })
+  expect((await buttonText(ui, 'opt-auto'))).toMatch(/^\[ \] Auto-answer/)
+  await ui.press({ key: 'opt-auto' })
+  expect((await buttonText(ui, 'opt-auto'))).toMatch(/^\[x\] Auto-answer/)
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'app/build', '--auto', '--as', 'orch-pane', '--', 'Q1', 'Keep', 'Q2', 'Keep']])
+  expect(w.wakes).toEqual([WAKE_TEXT])
+  // Nothing more to take: no second run, no second wake.
+  await clock.advance(16000)
+  expect(w.answers).toHaveLength(1)
+  expect(w.wakes).toHaveLength(1)
+
+  await ui.press({ key: 'tab:history' })
+  expect(await allText(ui)).toContain('◆ Auto')
+  await ui.unmount()
+})
+
+test('Auto-answer leaves a question the person has already touched', async ($, on) => {
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, [mkq(1), mkq(2)])])
+  await ui.press({ key: 'app/build:Q1:o1' })
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-auto' })
+  expect(w.answers).toEqual([[ORCH, 'answers', '-t', 'app/build', '--auto', '--as', 'orch-pane', '--', 'Q2', 'Keep']])
+  await ui.unmount()
+})
+
+test('a refused auto-answer is not retried on every poll and shows the error', async ($, on) => {
+  const { ui, w, clock } = await pane($, on, [withQs(PROGRAM, [mkq(1)])])
+  w.answered = { exitCode: 1, stdout: '', stderr: 'orch: Q1 is not --reversible yes' }
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-auto' })
+  await clock.advance(24000)
+  expect(w.answers).toHaveLength(1)
+  expect(w.wakes).toEqual([])
+  expect(await allText(ui)).toContain('orch answers failed')
+  await ui.unmount()
+})
+
+// -- notify -------------------------------------------------------------------------------------------
+
+test('Notify tells of a new question, not of the first look, and only while on', async ($, on) => {
+  const { ui, w, clock, store } = await pane($, on, [withQs(PROGRAM, [mkq(1)])])
+  await ui.press({ key: 'tab:more' })
+  await ui.press({ key: 'opt-notify' })
+  expect(store.get('opt:notify')).toBe(true)
+  await clock.advance(8000)
+  expect(w.notes).toEqual([])
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(1), mkq(2), mkq(3)])), stderr: '' }
+  await clock.advance(8000)
+  expect(w.notes).toEqual(['build: 2 new questions waiting for you'])
+  await ui.press({ key: 'opt-notify' })
+  w.result = { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(1), mkq(2), mkq(3), mkq(4)])), stderr: '' }
+  await clock.advance(8000)
+  expect(w.notes).toHaveLength(1)
+  await ui.unmount()
+})
+
+// -- groups and 200 questions ---------------------------------------------------------------------------
+
+function many() {
+  const GROUPS: [string, number][] = [['Pane layout', 20], ['Storage', 40], ['Cleanup jobs', 31], ['Release notes', 109]]
+  let n = 12
+  const open = GROUPS.flatMap(([group, size]) => Array.from({ length: size }, (): StatusQuestion => {
+    n += 1
+    return n === 33 ? { ...critical(n), group } : mkq(n, { group })
+  }))
+  return open
+}
+
+test('200 questions: groups, a long list drawn as a few rows, a critical one survives Accept, batches send', async ($, on) => {
+  const open = many()
+  expect(open.length).toBe(200)
+  const { ui, w } = await pane($, on, [withQs(PROGRAM, open, [], 12)])
+  expect(await allText(ui)).toContain('200 pending')
+  expect(await allText(ui)).toContain('12 of 212 sent')
+  expect(await allText(ui)).toContain('Pane layout')
+  expect(await allText(ui)).toContain('Release notes')
+  expect(await allText(ui)).toContain('· 18 more')
+  expect((await buttons(ui)).length).toBeLessThan(30)
+  expect(await allText(ui)).toContain('20 left')
+
+  // Storage is another group: its questions come from `orch status --json --question-group Storage`.
+  const storage = open.filter(q => q.group === 'Storage')
+  w.groups.Storage = output({ ...withQs(PROGRAM, open, [], 12), questions: { ...qblock(open, [], 12), open_group: 'Storage', open: storage } })
+  await ui.press({ key: 'group:app/build:Storage' })
+  expect(w.groupRuns).toHaveLength(1)
+  expect(w.groupRuns[0]).toEqual([ORCH, 'status', '--json', '--cwd', '/proj', '--question-group', 'Storage'])
+  expect(await allText(ui)).toContain('Delete item 33 for good?')
+  expect((await buttons(ui)).length).toBeLessThan(30)
+  expect(await buttonText(ui, 'accept:app/build')).toBe('Accept recommended in Storage (39)')
+  await ui.press({ key: 'accept:app/build' })
+  // The critical one is still the open question.
+  expect(await allText(ui)).toContain('Delete item 33 for good?')
+  expect(await buttonText(ui, 'send-now:app/build')).toBe('Send 39 now · 161 stay open')
+  await ui.press({ key: 'send-now:app/build' })
+  const argv = w.answers[0] ?? []
+  expect(argv.slice(0, 5)).toEqual([ORCH, 'answers', '-t', 'app/build', '--'])
+  expect(argv.length).toBe(5 + 39 * 2)
+  expect(argv).not.toContain('Q33')
+  expect(w.wakes).toHaveLength(1)
+  await ui.unmount()
+})
+
+// -- History ---------------------------------------------------------------------------------------------
+
+test('History pages ten at a time, searches, and marks auto-answers', async ($, on) => {
+  const done = Array.from({ length: 25 }, (_, i) => mkq(i + 1, {
+    status: i % 5 === 0 ? 'assumed' : 'answered', answer: i === 7 ? 'needle answer' : `answer ${i + 1}`, answered: '2026-10-29T10:00Z',
+    group: i % 2 === 0 ? 'Even' : null,
+  }))
+  const { ui } = await pane($, on, [withQs(PROGRAM, [], done, 25)])
+  await ui.press({ key: 'tab:history' })
+  expect(await allText(ui)).toContain('Page 1 of 3')
+  expect((await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('hist:'))).toHaveLength(10)
+  expect(await allText(ui)).toContain('◆ Auto')
+  expect(await allText(ui)).toContain('✓ Answered')
+  await ui.press({ key: 'hist-next' })
+  expect(await allText(ui)).toContain('Page 2 of 3')
+  expect(await buttonText(ui, 'hist-prev')).toBe('‹ Newer')
+  await ui.input({ key: 'hist-search', text: 'NEEDLE' })
+  expect((await ui.findAll({ type: 'Button' })).filter(b => b.key?.startsWith('hist:'))).toHaveLength(1)
+  expect(await allText(ui)).not.toContain('Page ')
+  await ui.press({ key: 'hist:Q8' })
+  expect(await allText(ui)).toContain('→ needle answer')
+  await ui.input({ key: 'hist-search', text: 'no such thing' })
+  expect(await allText(ui)).toContain('No matching questions.')
+  await ui.input({ key: 'hist-search', text: 'Even' })
+  expect(await allText(ui)).toContain('Page 1 of 2')
+  await ui.unmount()
+})
+
+// -- pure logic -----------------------------------------------------------------------------------------
+
+test('answerOf: a typed answer, then a pick, then the recommendation, and never a default for a critical question', () => {
+  const q = mkq(1)
+  const d = (over: Partial<Draft>): Draft => ({ pick: null, custom: null, confirmed: false, skipped: false, group: null, answer: null, ...over })
+  expect(answerOf(q, undefined)).toBe('Keep')
+  expect(answerOf(q, d({ pick: 'Change' }))).toBe('Change')
+  expect(answerOf(q, d({ pick: 'Change', custom: ' words ' }))).toBe('words')
+  expect(answerOf(q, d({ pick: 'Gone' }))).toBe('Keep')
+  expect(pickedLabel(q, d({ custom: 'words' }))).toBeNull()
+  expect(answerOf(critical(3), undefined)).toBeNull()
+  expect(answerOf(critical(3), d({ pick: 'Keep it' }))).toBe('Keep it')
+  expect(isCritical(critical(3))).toBe(true)
+  expect(isCritical(mkq(1, { reversible: 'unknown' }))).toBe(false)
+  expect(answerOf(mkq(1, { options: [qopt('A', 'x'), qopt('B', 'y')] }), undefined)).toBeNull()
+})
+
+test('option notes, meta text, queue order and the next question', () => {
+  expect(optionNote(qopt('A', 'does a thing'))).toBe('does a thing')
+  expect(optionNote(qopt('A', 'obvious from the name', false, 'reason'))).toBe('No explanation: obvious from the name')
+  expect(optionNote({ label: 'A', text: null, kind: null, recommended: false })).toBe('No explanation: not given')
+  expect(metaText(mkq(1, { blocks: '5' }))).toBe('blocks step 5 · can be changed later')
+  expect(metaText(mkq(1, { blocks: 'all', reversible: 'no' }))).toBe('blocks everything · cannot be undone')
+  expect(metaText(mkq(1, { blocks: null as unknown as string, reversible: 'unknown' }))).toBe('blocks everything · may not be undoable')
+  expect(mergeOrder(['Q2', 'Q1', 'Q7'], ['Q9', 'Q1', 'Q2'])).toEqual(['Q2', 'Q1', 'Q9'])
+  expect(mergeOrder(undefined, ['Q1', 'Q2'])).toEqual(['Q1', 'Q2'])
+  const dr = (confirmed: boolean, skipped = false): Draft => ({ pick: null, custom: null, confirmed, skipped, group: null, answer: confirmed ? 'x' : null })
+  expect(nextInQueue(['Q1', 'Q2', 'Q3'], { Q2: dr(true) }, 'Q1')).toBe('Q3')
+  expect(nextInQueue(['Q1', 'Q2', 'Q3'], { Q3: dr(false, true) }, 'Q2')).toBe('Q1')
+  expect(nextInQueue(['Q1'], undefined, 'Q1')).toBeNull()
+  expect(pickCurrent(['Q1', 'Q2'], { Q1: dr(true) }, 'Q1')).toBe('Q2')
+  expect(pickCurrent(['Q1', 'Q2'], undefined, 'Q2')).toBe('Q2')
+  expect(pickCurrent(['Q1', 'Q2'], undefined, 'Q9')).toBe('Q1')
+})
+
+test('answersArgv puts every answer after `--`; staleQuestion and autoPairs read their input strictly', () => {
+  expect(answersArgv(false, '/o', 'a/b', [['Q1', '--x'], ['Q2', 'y z']], false))
+    .toEqual(['/o', 'answers', '-t', 'a/b', '--', 'Q1', '--x', 'Q2', 'y z'])
+  expect(answersArgv(true, 'C:/o', 'a/b', [['Q1', 'k']], true))
+    .toEqual(['python', 'C:/o', 'answers', '-t', 'a/b', '--auto', '--as', 'orch-pane', '--', 'Q1', 'k'])
+  expect(staleQuestion('orch: Q12 is answered, not open; nothing written')).toBe('Q12')
+  expect(staleQuestion('orch: no question Q4 in /x; nothing written')).toBe('Q4')
+  expect(staleQuestion('orch: boom')).toBeNull()
+  const drafts: Record<string, Draft> = { Q2: { pick: 'Keep', custom: null, confirmed: false, skipped: false, group: null, answer: null } }
+  expect(autoPairs([mkq(1), mkq(2), critical(3), mkq(4, { reversible: 'unknown' }), mkq(5, { detail: 'compact', options: [] })], drafts))
+    .toEqual([['Q1', 'Keep']])
+  expect(acceptable(mkq(1), undefined)).toBe(true)
+  expect(acceptable(critical(3), undefined)).toBe(false)
+  expect(acceptable(mkq(1), { Q1: { ...drafts.Q2!, confirmed: true } })).toBe(false)
+})
+
+test('historyRows keeps answered and assumed ones that match, pages are counted', () => {
+  const h = [mkq(1, { status: 'answered', answer: 'yes' }), mkq(2, { status: 'withdrawn' }), mkq(3, { status: 'assumed', topic: 'Colour', answer: 'blue' })]
+  expect(historyRows(h, '').map(q => q.id)).toEqual(['Q1', 'Q3'])
+  expect(historyRows(h, ' COLOUR ').map(q => q.id)).toEqual(['Q3'])
+  expect(historyRows(h, 'zzz')).toEqual([])
+  expect([0, 1, 10, 11, 25].map(n => pageCount(n))).toEqual([1, 1, 1, 2, 3])
+})
+
+test('on Windows the answers run through python, from USERPROFILE', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(1)])), stderr: '' }, { OS: 'Windows_NT', USERPROFILE: 'C:\\Users\\u', HOME: '/c/Users/u' })
+  memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers).toEqual([['python', 'C:/Users/u/.claude/bin/orch', 'answers', '-t', 'app/build', '--', 'Q1', 'Keep']])
+  await ui.unmount()
+})
+
+test('mobile draws the questions and takes picks; typed answers need an Input it does not have', async ($, on) => {
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: output(withQs(PROGRAM, [mkq(1), mkq(2)])), stderr: '' })
+  memStore(on)
+  await start($, clock)
+  const ui = await $.ui.mount({ ...PANE, surface: 'mobile' })
+  expect(await allText(ui)).toContain('Should item 1 change?')
+  expect(await ui.find({ type: 'Input', key: 'app/build:Q1:own' })).toBeUndefined()
+  await ui.press({ key: 'app/build:Q1:o1' })
+  await ui.press({ key: 'next:app/build' })
+  await ui.press({ key: 'send:app/build' })
+  expect(w.answers[0]).toEqual([ORCH, 'answers', '-t', 'app/build', '--', 'Q1', 'Change', 'Q2', 'Keep'])
+  await ui.unmount()
 })

@@ -44,6 +44,8 @@ export type StatusQuestion = {
   options: StatusOption[]
   answer: string | null
   answered: string | null
+  // `full`, or `compact` / `minimal` once the list's byte budget is spent: those two carry no options.
+  detail?: 'full' | 'compact' | 'minimal'
 }
 
 export type StatusQuestions = {
@@ -157,6 +159,29 @@ export type AskState =
 // The folded bottom panel's open tab; null is all folded.
 export type Tab = 'history' | 'ask' | 'more'
 
+// An unsent answer, per task and question id (kept in $.store, D5). `answer` is what Next recorded: the option's
+// label or the typed text. Only a confirmed draft is sent.
+export type Draft = {
+  pick: string | null
+  custom: string | null
+  confirmed: boolean
+  skipped: boolean
+  group: string | null
+  answer: string | null
+}
+export type Drafts = Record<string, Record<string, Draft>>
+
+// What the answering panel remembers between draws: the open question and the open group of each task, the order
+// the questions joined the queue, other groups' questions fetched on demand, and what a Send said.
+export type QState = {
+  current: Record<string, string | null>
+  group: Record<string, string | null>
+  order: Record<string, string[]>
+  fetched: Record<string, StatusQuestion[]>
+  sending: Record<string, boolean>
+  error: Record<string, string | null>
+}
+
 declare module 'claude-code' {
   interface PluginState {
     'orch-pane': {
@@ -169,6 +194,11 @@ declare module 'claude-code' {
       ask: AskState
       tab: Tab | null
       ai: boolean
+      notify: boolean
+      auto: boolean
+      drafts: Shaped<{ loaded: boolean; byTask: Drafts }>
+      qstate: QState
+      hist: { query: string; page: number }
     }
   }
 }
