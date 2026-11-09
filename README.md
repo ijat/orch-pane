@@ -28,7 +28,9 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 
 `/orch-pane` opens the pane. It opens by itself at session start when the folder belongs to an active task's repo or worktree. The `[this repo]` / `[all tasks]` button switches scope.
 
-Tasks that need you (open questions, an error, or work that stalled for over 30 minutes) come first. Each task shows its Goal (one line; click to open), Now (what runs and the last activity), Progress, and its Milestones and Steps, folded around the current one; click a fold row to see them all.
+Each task is a status card: the goal (click to open), facts, an Overall and a Steps bar with counts (`1/3 · 33%`), and the running Agents (three shown, then `· N more`). Below it a Milestones/Steps panel folds done and later items around the current one; click a fold row to see them all. History, Ask and More are folded tabs (click again to fold); Advanced options holds the AI summaries switch and Auto-answer and Notify.
+
+**Needs you** lists the questions agents parked in `questions.md`, grouped, each option with a plain explanation. Pick an option or type an answer, then Next / Skip for now / Send; drafts are kept, and Hold on pauses a question without changing anything. Accept takes the recommended option and Auto-answer does so for reversible questions (recorded as assumed). History pages and searches the answered ones. Answers go through `orch answers`. Compact, then send asks the session to compact between turns (the `compact_when_idle` tool) before it wakes on your answer.
 
 An About section under Ask lists the version and commit of the orch skill, orch-index and this plugin, or `not installed`. The index records no commit, so it shows its version only. It is read once per session and again on `/orch-pane`.
 
