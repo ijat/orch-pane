@@ -68,6 +68,8 @@ export type StatusTask = {
   repo_path: string | null
   worktree: string | null
   in_cwd: boolean | null
+  // Absent on an orch older than `--session`; null when the pane passed no session id.
+  this_session?: boolean | null
   state: string
   state_words: string | null
   mode: string | null
