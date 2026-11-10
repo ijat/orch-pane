@@ -70,6 +70,8 @@ const OUTPUT = JSON.stringify({ schema: 1, generated: '2026-10-29T10:30Z', cwd: 
 
 type Ran = { exitCode: number; stdout: string; stderr: string }
 type World = {
+  // `refuseSession`: an orch that predates `--session` (exit 1, its real stderr) for any run that carries the flag.
+  refuseSession?: boolean
   runs: string[][]; indexRuns: string[][]; opens: number; paneOpen: boolean; placed: boolean; result: Ran; index: Ran
   // `orch answers` runs (its argv), its answer, and what the orch would then print for `status`.
   answers: string[][]; answered: Ran; onAnswers: (argv: string[]) => void
@@ -143,7 +145,9 @@ function world(on: On, result: Ran = { exitCode: 0, stdout: OUTPUT, stderr: '' }
     }
     const isIndex = e.argv.some(a => /orch-index(\.exe)?$/.test(a))
     ;(isIndex ? w.indexRuns : w.runs).push([...e.argv])
-    const ran = isIndex ? w.index : w.result
+    const ran = isIndex ? w.index
+      : w.refuseSession && e.argv.includes('--session') ? { exitCode: 1, stdout: '', stderr: "orch: unrecognized argument '--session'" }
+      : w.result
     return { value: { ...ran, isStdoutTruncated: false, isStderrTruncated: false } }
   })
   on('turn.complete', () => ({ text: '' }))
@@ -2342,16 +2346,34 @@ test('with an older orch (no this_session) or no session id the pane is as befor
   await ui.unmount()
 })
 
-test('an id but an older orch: the flag is passed, the key is missing, nothing changes on screen', async ($, on) => {
+// The mock's refusal is the real one: `~/.claude/bin/orch status --json --session x` on an orch without the flag
+// prints `orch: unrecognized argument '--session'` and exits 1.
+test('an id but an older orch that rejects --session: run again without it, the folder\'s tasks still show', async ($, on) => {
   on('session.id', () => ({ value: SESSION_ID }))
   const clock = mock.clock(on, { now: NOW })
-  const w = world(on, { exitCode: 0, stdout: OUTPUT, stderr: '' })
+  const w = world(on)
+  w.refuseSession = true
   await start($, clock)
-  expect(statusRun(w)).toContain('--session')
+  expect(w.runs).toEqual([[ORCH, 'status', '--json', '--cwd', '/proj', '--session', SESSION_ID], [ORCH, 'status', '--json', '--cwd', '/proj']])
   const ui = await $.ui.mount(PANE60('terminal'))
-  expect(await allText(ui)).not.toContain('this session')
+  const text = await allText(ui)
+  expect(text).not.toContain('this session')
+  expect(text).not.toContain('failed')
   expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo · 1 elsewhere]')
+  // The refusal is remembered: the next fetch goes straight to the plain command.
+  w.runs.length = 0
+  await clock.advance(8000)
+  expect(w.runs.length).toBeGreaterThan(0)
+  expect(w.runs.every(r => !r.includes('--session'))).toBe(true)
   await ui.unmount()
+})
+
+test('an id and an orch that fails for another reason: no retry, the error shows', async ($, on) => {
+  on('session.id', () => ({ value: SESSION_ID }))
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 1, stdout: '', stderr: 'orch: boom' })
+  await start($, clock)
+  expect(w.runs).toEqual([[ORCH, 'status', '--json', '--cwd', '/proj', '--session', SESSION_ID]])
 })
 
 test('this session\'s task comes first with all tasks shown, newest first, and other tasks follow', async ($, on) => {
