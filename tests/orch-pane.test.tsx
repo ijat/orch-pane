@@ -5,7 +5,7 @@ import type { Engine, MockClock } from 'claude-code/testing'
 import {
   agentPalette, agentPct, agentPctTail, askContext, barCells, barLayout, countTail, fold, goalLine, hhmm, idleMinutes, isStale, lastActivity, lineText, mdLite,
   bytesText, indexDetails, indexHeadline, indexLook, overallTail, parseIndex, placeText, plainInput, scopeLabel, shimmer,
-  sortByAttention, spawnOf, sparkline, stepsTail, textKey,
+  sortByAttention, splitScope, isMine, spawnOf, sparkline, stepsTail, textKey,
   WAKE_TEXT, acceptable, answerOf, answersArgv, autoPairs, historyRows, isCritical, mergeOrder, metaText, nextInQueue, optionNote,
   pageCount, pickCurrent, pickedLabel, staleQuestion, togglePick, isChosen, isMulti, needsHoldRow, openListOf, skipFor,
   COMPACT_TOOL_FULL, COMPACT_WAKE_TEXT, busyReason,
@@ -2287,4 +2287,103 @@ test('busyReason names the running roles, a spawn that has not returned, and ign
   expect(busyReason([task({ running: { roles: [], last_spawn: { ...spawn, returned: true } } })])).toBeNull()
   expect(busyReason([task({ in_cwd: false, running: { roles: [], last_spawn: spawn } })])).toBeNull()
   expect(busyReason([])).toBeNull()
+})
+
+// -- this session's task first ------------------------------------------------------------------------------
+
+const MINE = { ...OTHER, id: 'elsewhere/drive', repo: 'elsewhere', slug: 'drive', in_cwd: false, this_session: true, updated: '2026-10-29T10:25Z' }
+const SESSION_ID = 'sess-1'
+const statusRun = (w: World) => w.runs.find(r => r.includes('status') && !r.includes('--question-group'))
+
+test('this session\'s task in another repo is shown first, open, with its open questions', async ($, on) => {
+  on('session.id', () => ({ value: SESSION_ID }))
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: output(PROGRAM, withQs(MINE, [mkq(1)])), stderr: '' })
+  await start($, clock)
+  expect(statusRun(w)).toEqual([ORCH, 'status', '--json', '--cwd', '/proj', '--session', SESSION_ID])
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const heads = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('task:'))
+  expect(heads).toEqual(['task:elsewhere/drive', 'task:app/build'])
+  const text = await allText(ui)
+  expect(await ui.find({ type: 'Text', text: /^this session$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^this repo$/ })).toBeDefined()
+  expect(text).toContain('Should item 1 change?')
+  // The count of tasks elsewhere leaves this session's task out.
+  expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo]')
+  await ui.unmount()
+})
+
+test('a task that is this session\'s and in this folder appears once, under this session', async ($, on) => {
+  on('session.id', () => ({ value: SESSION_ID }))
+  const clock = mock.clock(on, { now: NOW })
+  world(on, { exitCode: 0, stdout: output({ ...PROGRAM, this_session: true }), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const heads = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('task:'))
+  expect(heads).toEqual(['task:app/build'])
+  const text = await allText(ui)
+  expect(text).toContain('this session')
+  expect(await ui.find({ type: 'Text', text: /^this repo$/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('with an older orch (no this_session) or no session id the pane is as before', async ($, on) => {
+  on('session.id', () => { throw new Error('no session id') })
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: OUTPUT, stderr: '' })
+  await start($, clock)
+  expect(w.runs).toEqual([[ORCH, 'status', '--json', '--cwd', '/proj']])
+  const ui = await $.ui.mount(PANE60('terminal'))
+  const text = await allText(ui)
+  expect(text).not.toContain('this session')
+  expect(await ui.find({ type: 'Text', text: /^this repo$/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo · 1 elsewhere]')
+  expect(await ui.find({ type: 'Button', key: 'task:other/fix' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('an id but an older orch: the flag is passed, the key is missing, nothing changes on screen', async ($, on) => {
+  on('session.id', () => ({ value: SESSION_ID }))
+  const clock = mock.clock(on, { now: NOW })
+  const w = world(on, { exitCode: 0, stdout: OUTPUT, stderr: '' })
+  await start($, clock)
+  expect(statusRun(w)).toContain('--session')
+  const ui = await $.ui.mount(PANE60('terminal'))
+  expect(await allText(ui)).not.toContain('this session')
+  expect((await ui.find({ type: 'Button', key: 'scope' }))?.text).toBe('[this repo · 1 elsewhere]')
+  await ui.unmount()
+})
+
+test('this session\'s task comes first with all tasks shown, newest first, and other tasks follow', async ($, on) => {
+  on('session.id', () => ({ value: SESSION_ID }))
+  const clock = mock.clock(on, { now: NOW })
+  const older = { ...MINE, id: 'x/old', slug: 'old', updated: '2026-10-29T09:00Z' }
+  world(on, { exitCode: 0, stdout: output(OTHER, older, PROGRAM, MINE), stderr: '' })
+  await start($, clock)
+  const ui = await $.ui.mount(PANE60('terminal'))
+  await ui.press({ key: 'scope' })
+  const heads = (await ui.findAll({ type: 'Button' })).map(b => b.key ?? '').filter(k => k.startsWith('task:'))
+  expect(heads).toEqual(['task:elsewhere/drive', 'task:x/old', 'task:other/fix', 'task:app/build'])
+  expect(await allText(ui)).toContain('other tasks')
+  await ui.unmount()
+})
+
+test('splitScope and isMine: the session group, the folder group, never both', () => {
+  const [a, b, c, d] = [
+    task({ id: 'a', in_cwd: true }), task({ id: 'b', in_cwd: false, this_session: true, updated: '2026-10-29T10:10Z' }),
+    task({ id: 'c', in_cwd: true, this_session: true, updated: '2026-10-29T10:20Z' }), task({ id: 'd', in_cwd: false, this_session: false }),
+  ]
+  const s = splitScope([a, b, c, d], false, T0)
+  expect(s.session.map(t => t.id)).toEqual(['c', 'b'])
+  expect(s.rest.map(t => t.id)).toEqual(['a'])
+  expect(splitScope([a, b, c, d], true, T0).rest.map(t => t.id)).toEqual(['a', 'd'])
+  expect([a, b, c, d].map(isMine)).toEqual([true, true, true, false])
+  expect(isMine(task({ in_cwd: false }))).toBe(false)
+  expect(splitScope([a, d], false, T0)).toEqual({ session: [], rest: [a] })
+})
+
+test('busyReason counts this session\'s task in another folder', () => {
+  const spawn = { ts: 't', role: 'planner', agent: 'orch-planner', tier: 'opus/high', steps: null, milestone: null, returned: false }
+  expect(busyReason([task({ in_cwd: false, this_session: true, running: { roles: [], last_spawn: spawn } })]))
+    .toBe('planner was spawned and has not returned (task r/t)')
 })

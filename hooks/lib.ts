@@ -102,6 +102,26 @@ export function sortByAttention(tasks: readonly StatusTask[], now: number | null
     .map(x => x.t)
 }
 
+// A task of this folder, or one this very session drives (`this_session`, set by `orch status --json --session`; absent on
+// an older orch, then only the folder counts).
+export const isMine = (t: StatusTask) => t.in_cwd === true || t.this_session === true
+
+// The tasks to show: this session's first (most recently updated first), then the rest by attention. With `all` off the
+// rest is this folder's tasks; a task of this session is never in both.
+export function splitScope(tasks: readonly StatusTask[], all: boolean, now: number | null): { session: StatusTask[]; rest: StatusTask[] } {
+  const lastAt = (t: StatusTask) => {
+    const logAt = t.last_log ? parsed(LOG_RE.exec(t.last_log.trim())?.[1]) : null
+    return Math.max(parsed(t.updated) ?? -Infinity, logAt ?? -Infinity)
+  }
+  const session = tasks
+    .filter(t => t.this_session === true)
+    .map((t, i) => ({ t, i, at: lastAt(t) }))
+    .sort((x, y) => y.at - x.at || x.i - y.i)
+    .map(x => x.t)
+  const rest = sortByAttention(tasks.filter(t => t.this_session !== true && (all || t.in_cwd === true)), now)
+  return { session, rest }
+}
+
 const baseName = (p: string) => p.replace(/[\\/]+$/, '').split(/[\\/]/).pop() ?? p
 
 // Where a task lives: "RznSans · [WT] orch-rznmono-0006" (the worktree's folder), or just the repo name.
@@ -667,9 +687,9 @@ export const COMPACT_SEND_NOTE =
   'Keep the task state, the parked questions and the answers just recorded; read them back with `orch` rather than from memory.'
 
 // Why a compaction must wait: a subagent runs, or a spawn was recorded and has not returned. Only tasks of this
-// folder count. Null when nothing runs.
+// folder or session count. Null when nothing runs.
 export function busyReason(tasks: readonly StatusTask[]): string | null {
-  for (const t of tasks.filter(x => x.in_cwd === true && isRunning(x))) {
+  for (const t of tasks.filter(x => isMine(x) && isRunning(x))) {
     const roles = t.running.roles.map(r => r.role ?? '?')
     const spawn = t.running.last_spawn
     return roles.length > 0

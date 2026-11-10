@@ -5,7 +5,7 @@ import type { About, AboutPart, AskState, Draft, Drafts, IndexStatus, PlainEntry
 import {
   GREY, agentPalette, agentPct, agentPctTail, ago, askContext, barCells, barLayout, clip, countTail, elapsed, fold, goalLine, hhmm, idleMinutes, indexDetails, indexHeadline,
   indexLook, indexNeedsAnswerWarning, isRunning, isStale, lastActivity, mdLite, overallTail, parseIndex, placeText, plainInput,
-  scopeLabel, shimmer, sortByAttention, spawnOf, stateColor, stepsTail, stripMarks, textKey,
+  isMine, scopeLabel, shimmer, splitScope, spawnOf, stateColor, stepsTail, stripMarks, textKey,
   HISTORY_PAGE, NO_DRAFT, WAKE_TEXT, acceptable, activeGroupOf, answerOf, answersArgv, autoPairs, confirmedOf, groupKey, hasOptions,
   historyRows, isChosen, isCritical, isMulti, togglePick, mergeOrder, metaText, needsHoldRow, nextInQueue, openListOf, optionNote, pageCount, pickCurrent, pickedLabel,
   recommendedOf, skipFor, staleQuestion, UNGROUPED, HOLD_LABEL, HOLD_NOTE,
@@ -143,6 +143,17 @@ async function fetchAbout($: EngineInterface, home: string, windows: boolean): P
   return [part('orch skill', ver(skillV), skillC), part('orch-index', ver(indexV), null), part('orch-pane', paneV ?? null, paneC ?? null)]
 }
 
+// `--session <id>`: this session's id, so orch marks the task this session drives (`this_session`). Read at each call:
+// the id changes after a /clear. [] when it cannot be read; the pane then behaves as it did before.
+async function sessionArgs($: EngineInterface): Promise<string[]> {
+  try {
+    const id = await $.session.id()
+    return typeof id === 'string' && id ? ['--session', id] : []
+  } catch {
+    return []
+  }
+}
+
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
 async function fetchStatusOnce($: EngineInterface): Promise<StatusJson | null> {
   if (inFlight) return null
@@ -159,7 +170,7 @@ async function fetchStatusOnce($: EngineInterface): Promise<StatusJson | null> {
     const orch = `${home.replace(/\\/g, '/')}/.claude/bin/orch`
     let ran
     try {
-      ran = await $.process.run([...(windows ? ['python'] : []), orch, 'status', '--json', '--cwd', cwd], {
+      ran = await $.process.run([...(windows ? ['python'] : []), orch, 'status', '--json', '--cwd', cwd, ...(await sessionArgs($))], {
         timeoutMs: RUN_TIMEOUT_MS,
       })
     } catch (err) {
@@ -248,13 +259,13 @@ const withoutDrafts = (all: Drafts, taskId: string, ids: readonly string[]): Dra
   return Object.keys(mine).length > 0 ? { ...rest, [taskId]: mine } : rest
 }
 
-type Where = { windows: boolean; home: string; orch: string; cwd: string }
+type Where = { windows: boolean; home: string; orch: string; cwd: string; session: string[] }
 
 async function whereIsOrch($: EngineInterface): Promise<Where | null> {
   const windows = (await $.env.get('OS')) === 'Windows_NT'
   const home = windows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
   if (!home) return null
-  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd() }
+  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd(), session: await sessionArgs($) }
 }
 
 // `orch status --json --question-group <label>` (from the `skip`-th question on in full): the data, or null.
@@ -263,7 +274,7 @@ async function runGroup($: EngineInterface, label: string, skip: number): Promis
   if (!where) return null
   let ran
   try {
-    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, '--question-group', label,
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...where.session, '--question-group', label,
       ...(skip > 0 ? ['--question-skip', String(skip)] : [])], { timeoutMs: RUN_TIMEOUT_MS })
   } catch {
     return null
@@ -355,7 +366,7 @@ async function whyNotNow($: EngineInterface): Promise<string | null> {
   if (!where) return 'orch could not be found (HOME is not set)'
   let ran
   try {
-    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd], { timeoutMs: RUN_TIMEOUT_MS })
+    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...where.session], { timeoutMs: RUN_TIMEOUT_MS })
   } catch (err) {
     return `orch status could not run: ${errorText(err)}`
   }
@@ -505,8 +516,8 @@ async function autoPass($: EngineInterface) {
     const q = await readQ($)
     let landed = false
     for (const t of data.tasks) {
-      // Only this folder's tasks: another repo's decisions are not taken here, and this session is not woken for them.
-      if (!t.questions || t.in_cwd !== true) continue
+      // Only this folder's and this session's tasks: another repo's decisions are not taken here, and this session is not woken for them.
+      if (!t.questions || !isMine(t)) continue
       const pairs = autoPairs(viewOf(t, q, ds).list, ds[t.id]).filter(([id]) => !autoDone.get(t.id)?.has(id))
       const sig = pairs.map(p => p.join('=')).join('|')
       if (pairs.length === 0 || autoFailed.get(t.id) === sig) continue
@@ -585,7 +596,7 @@ async function expireLost($: EngineInterface) {
 async function spinIfRunning($: EngineInterface) {
   await expireLost($)
   const [snap, all] = [await read($, snapshot), await read($, showAll)]
-  const running = (snap.data?.tasks ?? []).some(t => (all || t.in_cwd) && isRunning(t))
+  const running = (snap.data?.tasks ?? []).some(t => (all || isMine(t)) && isRunning(t))
   const loading = (await read($, ask)).state === 'busy' || Object.values(await read($, plain)).some(p => p.state === 'pending')
   if ((running || loading) && (await isOpen($))) await update($, frame, n => ((n ?? 0) + 1) % FRAME_WRAP)
 }
@@ -821,7 +832,7 @@ async function sendTask($: EngineInterface, t: StatusTask, last?: StatusQuestion
   await writeDrafts($, all => withoutDrafts(all, t.id, pairs.map(p => p[0])))
   // Another folder's task belongs to another session: its answers are on disk, and this session is neither
   // compacted nor woken for them.
-  if (t.in_cwd !== true) {
+  if (!isMine(t)) {
     await setQ($, t.id, { sending: false, error: null })
     await fetchStatus($)
     $.ui.toast(`${plural(pairs.length, 'answer')} saved; that task's session reads them at its next checkpoint`)
@@ -850,7 +861,7 @@ const stepState = (s: StatusStep): ItemState => (s.done ? 'done' : s.current ? '
 const percentText = (t: StatusTask) => (t.overall.percent === null ? '' : `${t.overall.percent}%`)
 
 // What a Send does next: only a task of this folder has its agent woken here.
-const afterSend = (t: StatusTask) => (t.in_cwd !== true ? 'saved for that task\'s session' : isRunning(t) ? 'agent keeps working' : 'wakes the agent')
+const afterSend = (t: StatusTask) => (!isMine(t) ? 'saved for that task\'s session' : isRunning(t) ? 'agent keeps working' : 'wakes the agent')
 
 const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? '' : 's'}`
 
@@ -912,7 +923,7 @@ export const register: Register = on => {
     void loadDrafts($)
     void (async () => {
       const data = await fetchStatus($)
-      if (data?.tasks.some(t => t.in_cwd) && !(await read($, dismissed))) {
+      if (data?.tasks.some(isMine) && !(await read($, dismissed))) {
         await $.ui.open({ id: PANE, title: TITLE })
       }
     })()
@@ -982,8 +993,10 @@ export const register: Register = on => {
     // A panel's border and padding take 4 columns; an item's summary sits 2 in from its row.
     const room = width - 4
     const everyTask = snap.data?.tasks ?? []
-    const tasks = sortByAttention(everyTask.filter(t => all || t.in_cwd), now)
-    const elsewhere = everyTask.filter(t => t.in_cwd !== true).length
+    // This session's tasks come first, whatever the repo; the rest follow without them.
+    const { session: sessionTasks, rest: repoTasks } = splitScope(everyTask, all, now)
+    const tasks = [...sessionTasks, ...repoTasks]
+    const elsewhere = everyTask.filter(t => !isMine(t)).length
     const isExpanded = (key: string, fallback = false) => open[key] ?? fallback
     const toggle = (key: string, fallback = false) => () =>
       update($, expanded, m => ({ ...m, [key]: !((m ?? {})[key] ?? fallback) }))
@@ -1227,7 +1240,7 @@ export const register: Register = on => {
       ]
     }
 
-    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, t.in_cwd === true)
+    const taskOpen = (t: StatusTask) => isExpanded(`task:${t.id}`, isMine(t))
 
     // The status card: name and state, goal, facts, the Overall and Steps bars, and the Agents.
     const card = (t: StatusTask, key: string) => {
@@ -1241,7 +1254,7 @@ export const register: Register = on => {
       const layout = barLayout(room, progress)
       return panel([
         head(
-          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+          <Button key={key} plain onPress={toggle(key, isMine(t))}>
             <Text color={color}>▾</Text>{' '}
             <Text bold>{clip(name, Math.max(8, room - badge.length - state.length - 4))}</Text>
           </Button>,
@@ -1460,7 +1473,7 @@ export const register: Register = on => {
       const questions = t.questions_open ?? 0
       return (
         <Box flexDirection="column" marginTop={gap}>
-          <Button key={key} plain onPress={toggle(key, t.in_cwd === true)}>
+          <Button key={key} plain onPress={toggle(key, isMine(t))}>
             <Text color={color}>▸</Text>{' '}
             <Text bold>{clip(name, Math.max(8, width - 30))}</Text>
             {'  '}
@@ -1637,7 +1650,10 @@ export const register: Register = on => {
         {snap.error && <Text color="error">{snap.error}</Text>}
         {!snap.data && !snap.error && <Text dimColor>Loading…</Text>}
         {empty && <Text dimColor>{empty}</Text>}
-        {tasks.map(taskBlock)}
+        {sessionTasks.length > 0 && subhead('this session')}
+        {sessionTasks.map(taskBlock)}
+        {sessionTasks.length > 0 && repoTasks.length > 0 && subhead(all ? 'other tasks' : 'this repo')}
+        {repoTasks.map((t, i) => taskBlock(t, sessionTasks.length + i))}
         {panel([tabBar, ...tabBody])}
       </Box>
     )
