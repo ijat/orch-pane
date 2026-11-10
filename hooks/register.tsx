@@ -144,14 +144,32 @@ async function fetchAbout($: EngineInterface, home: string, windows: boolean): P
 }
 
 // `--session <id>`: this session's id, so orch marks the task this session drives (`this_session`). Read at each call:
-// the id changes after a /clear. [] when it cannot be read; the pane then behaves as it did before.
+// the id changes after a /clear. [] when it cannot be read, or when an older orch refused the flag (see below); the
+// pane then behaves as it did before.
+let orchRefusesSession = false
+
 async function sessionArgs($: EngineInterface): Promise<string[]> {
+  if (orchRefusesSession) return []
   try {
     const id = await $.session.id()
     return typeof id === 'string' && id ? ['--session', id] : []
   } catch {
     return []
   }
+}
+
+// The one way to run `orch status --json`: `argv(session)` is the whole command with `session` (`--session <id>` or
+// nothing) placed where it belongs. An orch that predates the flag exits 1 with "unrecognized argument '--session'":
+// the run is repeated without it, and the flag is left out until the next session start or /orch-pane (an upgraded
+// orch is picked up then). Every other failure comes back as it is.
+async function runStatus($: EngineInterface, argv: (session: string[]) => string[]) {
+  const session = await sessionArgs($)
+  const ran = await $.process.run(argv(session), { timeoutMs: RUN_TIMEOUT_MS })
+  if (session.length > 0 && ran.exitCode !== 0 && ran.stderr.includes('--session')) {
+    orchRefusesSession = true
+    return $.process.run(argv([]), { timeoutMs: RUN_TIMEOUT_MS })
+  }
+  return ran
 }
 
 // Runs `orch status --json` once; the last good data stays when it fails. One run at a time.
@@ -170,9 +188,7 @@ async function fetchStatusOnce($: EngineInterface): Promise<StatusJson | null> {
     const orch = `${home.replace(/\\/g, '/')}/.claude/bin/orch`
     let ran
     try {
-      ran = await $.process.run([...(windows ? ['python'] : []), orch, 'status', '--json', '--cwd', cwd, ...(await sessionArgs($))], {
-        timeoutMs: RUN_TIMEOUT_MS,
-      })
+      ran = await runStatus($, session => [...(windows ? ['python'] : []), orch, 'status', '--json', '--cwd', cwd, ...session])
     } catch (err) {
       await setError($, `orch status could not run: ${errorText(err)}`)
       return null
@@ -259,13 +275,13 @@ const withoutDrafts = (all: Drafts, taskId: string, ids: readonly string[]): Dra
   return Object.keys(mine).length > 0 ? { ...rest, [taskId]: mine } : rest
 }
 
-type Where = { windows: boolean; home: string; orch: string; cwd: string; session: string[] }
+type Where = { windows: boolean; home: string; orch: string; cwd: string }
 
 async function whereIsOrch($: EngineInterface): Promise<Where | null> {
   const windows = (await $.env.get('OS')) === 'Windows_NT'
   const home = windows ? await $.env.get('USERPROFILE') : await $.env.get('HOME')
   if (!home) return null
-  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd(), session: await sessionArgs($) }
+  return { windows, home, orch: `${home.replace(/\\/g, '/')}/.claude/bin/orch`, cwd: await $.session.cwd() }
 }
 
 // `orch status --json --question-group <label>` (from the `skip`-th question on in full): the data, or null.
@@ -274,8 +290,8 @@ async function runGroup($: EngineInterface, label: string, skip: number): Promis
   if (!where) return null
   let ran
   try {
-    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...where.session, '--question-group', label,
-      ...(skip > 0 ? ['--question-skip', String(skip)] : [])], { timeoutMs: RUN_TIMEOUT_MS })
+    ran = await runStatus($, session => [...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...session, '--question-group', label,
+      ...(skip > 0 ? ['--question-skip', String(skip)] : [])])
   } catch {
     return null
   }
@@ -366,7 +382,7 @@ async function whyNotNow($: EngineInterface): Promise<string | null> {
   if (!where) return 'orch could not be found (HOME is not set)'
   let ran
   try {
-    ran = await $.process.run([...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...where.session], { timeoutMs: RUN_TIMEOUT_MS })
+    ran = await runStatus($, session => [...(where.windows ? ['python'] : []), where.orch, 'status', '--json', '--cwd', where.cwd, ...session])
   } catch (err) {
     return `orch status could not run: ${errorText(err)}`
   }
@@ -912,6 +928,7 @@ export const register: Register = on => {
     }
     compactAsked = null
     compactRunning = false
+    orchRefusesSession = false
     $.clock.every(POLL_MS, () => void refreshIfOpen($))
     $.clock.every(SPIN_MS, () => void spinIfRunning($))
     // A reload starts from a clean slate: what the poll saw last, and the auto-answers that failed.
@@ -933,6 +950,7 @@ export const register: Register = on => {
 
   on('command.run', { command: 'orch-pane' }, async $ => {
     await update($, dismissed, () => false)
+    orchRefusesSession = false
     await update($, snapshot, s => ({ ...(s ?? EMPTY), about: null }))
     await $.ui.open({ id: PANE, title: TITLE })
     await fetchStatus($)
